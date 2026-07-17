@@ -1,8 +1,3 @@
-## Script overview (execution order)
-
-All analysis scripts are located in the `src/` directory.  
-Each script corresponds to a specific step in the human–macaque–marmoset comparative analysis workflow.
-
 ### 01_Preprocess_Human_Macaque.Rmd
 Human and macaque preprocessing pipeline (QC, normalization, initial filtering).
 
