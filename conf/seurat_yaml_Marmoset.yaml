@@ -1,0 +1,39 @@
+# 複数ある場合 mergeかintefrate
+sample:
+  - "/Analysis/work/Cellranger_Result/I7704M_1yr8mnth/outs/"
+  - "/Analysis/work/Cellranger_Result/I7436M_2ys8mnth/outs/"
+  
+
+sampleName:
+  - "I7704M_1yr8mnth"
+  - "I7436M_2ys8mnth"
+  
+Integrate: TRUE
+
+outdir: "/Analysis/work/work_kuze/result/marmoset_260623/"
+
+numcoler: 20
+
+# remove CellCycle Gene:
+rmCellCycle: TRUE
+
+# cell filter
+# Metadata の情報をベースにdplyr::filterでフィルタリングを行う。条件式が反映される。
+CellFilter: "nFeature_RNA > 1000 & nFeature_RNA < 10000 "
+
+# Preprocess parmeter
+NumVarFeature: 4000
+pca_ndim: 1:20
+resolution: 0.3
+
+# subset parm
+#subset.Cluster: c( 1,2,4,5,8 )
+#subset.NumVarFeature: 1000
+#subset.pca_ndim: 1:10
+#subset.resolution: 0.3
+
+# Monocle Cluster Infromation
+CenterCluster: 8
+monocle.useCluster: c( 1,2,4,5,8 )
+#
+monocle.useCluster.umaploc: "umap_1 < 4 & umap_1 > -8 & umap_2 < 1 & umap_2 > -14"

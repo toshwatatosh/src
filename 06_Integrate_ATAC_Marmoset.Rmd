@@ -1,0 +1,234 @@
+---
+title: "Integrate ATAC data"
+subtitle: "Marmoset"
+doc_type: 作業報告書
+author: 株式会社ダイナコム 久世、佐藤、江端
+date: "`r format(Sys.time(), '%Y年%m月%d日')`"
+output:
+    html_document:
+        toc: true
+        toc_depth: 4
+        toc_float:    # 目次は固定にしない
+          collapsed: false
+        number_section: true
+        pandoc_args: ["--from", "markdown+autolink_bare_uris+tex_math_single_backslash-implicit_figures"]
+        self_contained: False
+---
+
+```{=html}
+<!-- 
+sample1
+sample1
+merge
+Integrate
+
+QC & preprocess
+PCA / UMAP / Cluster/ CellCycle / FeatureGene / DEG
+
+-->
+```
+
+<!-- 画像をクリックすると拡大表示するjs -->
+```{js echo=FALSE}
+$(function(){
+  $("img:not(.lb-image)").wrap(function() {
+    return "<a href='" + $(this).attr("src") + "' data-lightbox='" + $(this).attr("scr") + "'></a>";
+  });
+});
+```
+
+## Load Library
+
+```{r setup, include=F ,echo =T}
+setwd("/home/kuze/work/NCCHD_DrWatanabe/2025_scMultiome_analysis/")
+
+# ライブラリ読み込み先を指定
+.libPaths( c("/home/kuze/Rprj/NCCHD_DrWatanabe_2025/") )
+knitr::opts_chunk$set(echo = TRUE)
+
+#library(monocle3)
+library(Seurat)
+library(SeuratData)
+library(SeuratWrappers)
+library(ggplot2)
+library(patchwork)
+library(magrittr)
+library(dplyr)
+library(tidyverse)
+library(cowplot)
+library(yaml)
+library(DT)
+library(ggplot2)
+library(Polychrome)
+library(Signac)
+
+library(BSgenome.Cjacchus.UCSC.calJac4)
+
+set.seed(1234)
+options(future.globals.maxSize = 1e10)
+```
+
+```{r Make color palet , include= FALSE}
+#set.seed(1234)
+palette <- createPalette(20,　seedcolors=  c("#010101", "#ff0000"), M = 1000,prefix="NA")
+names(palette) <- NULL
+# カラーパレットを表示します
+print(palette)
+# カラーパレットを視覚的に確認するためのプロット
+swatch(palette)
+```
+
+## Read YAML
+Parmeterを記載したYAMLファイルの読み込み
+
+```{r ReadYAML, include=FALSE, echo =F}
+# 引数で指定できるように
+yaml_file = "/home/kuze/work/NCCHD_DrWatanabe/2025_scMultiome_analysis/config/IntegrateATAC_Marmoset.yaml"
+param <- yaml.load_file(yaml_file)
+```
+
+```{r Print YAML, include=TRUE}
+# outdirがなければ作成
+dir_path <- param$outdir
+# ディレクトリの存在を確認し、存在しない場合は作成
+if (!dir.exists(dir_path)) {
+  dir.create(dir_path, recursive = TRUE)
+  message("ディレクトリを作成しました: ", dir_path)
+} else {
+  message("output ディレクトリは既に存在します: ", dir_path)
+}
+
+#ndim <- eval(parse(text = param$pca_ndim))
+if (!is.null(param$pca_ndim)){
+  param$pca_ndim <-  eval(parse(text = param$pca_ndim)) 
+}
+# ndim <- param$pca_ndim 
+# param$monocle.useCluster <- eval(parse(text = param$monocle.useCluster))
+
+print(param)
+
+```
+
+
+```{r Read_old data, include=TRUE}
+#marmoset
+SeuratOBJ <- readRDS(param$SeuratOBJ)
+DefaultAssay(SeuratOBJ) <-"RNA"
+SeuratOBJ[["RNA"]] <- JoinLayers(SeuratOBJ[["RNA"]])
+c1meta_file <- param$extrmeta
+c1meta <- read.table(c1meta_file, header = TRUE, row.names = 1, sep = "\t", comment.char = "" )
+SeuratOBJ$ManualCluster <-paste0("Clsuter", SeuratOBJ$seurat_clusters )
+SeuratOBJ$ManualCluster[c1meta %>% filter(seurat_clusters == "1") %>% rownames()] <- c1meta %>% filter(seurat_clusters == "1") %>%pull(M3group) %>% gsub("^C","Clsuter",.)
+
+```
+
+```{r push ATAC data , include=TRUE}
+
+# peak combined
+atac_peak_list <- list()
+for ( i in c(1:length(param$sampleName )) ) {
+  sampleID = param$sampleName[i]
+  datapath =param$sample[i]
+  
+  peak.file = paste0(datapath ,"atac_peaks.bed")
+  peaksdata <- read.table(
+    file = peak.file,
+    col.names = c("chr", "start", "end")
+  )
+  atac_peak_list[[i]] <-makeGRangesFromDataFrame(peaksdata)
+}
+combined.peaks <- Signac::reduce(x = c( atac_peak_list[[1]] , atac_peak_list[[2]]) )
+
+# Filter out bad peaks based on length
+peakwidths <- width(combined.peaks)
+combined.peaks <- combined.peaks[peakwidths  < 10000 & peakwidths > 20]
+combined.peaks
+
+#annotations_test <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+annotations <-  rtracklayer::import(param$gtf)
+seqlevelsStyle(annotations) <- 'UCSC'
+genome(annotations) <- "caljack4"
+atac_assay_list <- list()
+
+for ( i in c(1:length(param$sampleName )) ) {
+  sampleID = param$sampleName[i]
+  datapath =param$sample[i]
+  gex_bcname <- SeuratOBJ@meta.data %>%
+    dplyr::filter( orig.ident == sampleID) %>%
+    rownames()
+  gex_barcodeList <-  gex_bcname %>% 
+            gsub( paste0(sampleID,"_"),"",.)
+  names(gex_barcodeList) <- gex_bcname
+  # load metadata
+  #md.file = paste0(datapath, "/per_barcode_metrics.csv")
+  #md <- read.table( file = md.file, stringsAsFactors = FALSE, sep = ",",  header = TRUE,  row.names = 1)[-1, ]
+  #md <- md[ md$gex_barcode %in% gex_barcodeList , ]
+  # create fragment objects
+  frag.file = paste0(datapath,"/atac_fragments.tsv.gz")
+  frags.data <- CreateFragmentObject(path = frag.file,cells = gex_barcodeList )
+
+  atac.counts <- FeatureMatrix( fragments = frags.data, features =combined.peaks , cells = gex_bcname )
+  atac_assay_list[[i]] <- CreateChromatinAssay(counts = atac.counts, fragments = frags.data  , annotation = annotations )
+}
+
+#atac_assay_list <- readRDS("atac_assay_list.rds")
+mergedAtac <- merge(x =atac_assay_list[[1]] , y= atac_assay_list[[2]] )
+SeuratOBJ[["ATAC"]] <- mergedAtac
+Annotation( SeuratOBJ[["ATAC"]] ) <- annotations
+
+saveRDS( SeuratOBJ ,  paste0(param$outdir , "/IntegratedATAC_OBJ.rds" ))
+export(combined.peaks, con =paste0(param$outdir , "/cobinedPekas.bed" ), format = "BED")
+
+```
+
+```{r peak reduce, include=TRUE}
+SeuratOBJ <- readRDS(paste0(param$outdir , "/IntegratedATAC_OBJ.rds" ))
+#DefaultAssay(SeuratOBJ) <-"RNA"
+#SeuratOBJ[["RNA"]] <- JoinLayers(SeuratOBJ[["RNA"]])
+
+DefaultAssay(SeuratOBJ) <-"ATAC"
+
+num_cells <- ncol(SeuratOBJ)
+min_cellsofPeak <- num_cells * 0.05
+peak_selection_flags <- apply( SeuratOBJ@assays$ATAC@counts, 1 , function(x){ return (sum(x>0) > min_cellsofPeak) } )
+reduced_peak <- combined.peaks[peak_selection_flags,]
+export(reduced_peak, con =paste0(param$outdir , "/cobinedPekas_rm_under_5pct_population.bed" ), format = "BED")
+
+```
+
+
+```{r writMM , include=TRUE}
+
+exp <-GetAssayData(SeuratOBJ , layer = "counts" , assay = "RNA")
+atac <- GetAssayData(SeuratOBJ , layer = "counts", assay = "ATAC")
+atac_exp_mat <- rbind(exp ,atac)
+
+# save sparse matrix
+sparse.atac_exp_mat <- Matrix(atac_exp_mat , sparse = T )
+head(sparse.atac_exp_mat)
+## Market Exchange Format (MEX) format
+writeMM(obj = sparse.atac_exp_mat, file= paste0(param$outdir , "/matrix.mtx" ))
+
+
+# save genes and cells names
+write(x = rownames(atac_exp_mat), file = paste0(param$outdir ,"/genes.tsv"))
+barcode <-  colnames(atac_exp_mat)
+barcode[ grep(param$sampleName[2], barcode)] <- gsub( "-1$" ,"-2", barcode[ grep(param$sampleName[2], barcode)])
+barcode <- gsub(param$sampleName[1] ,"" , barcode)
+barcode <- gsub(param$sampleName[2] ,"" , barcode)
+barcode <- gsub("^_" ,"" , barcode)
+write(x = barcode, file = "barcodes.tsv")
+
+output.file = paste0( param$outdir,"/metadata_Input_SeuratOBJ.txt" )
+write.table( SeuratOBJ@meta.data , file =output.file , quote = F ,sep ="\t" ,row.names = T )
+# for LINGER
+
+SeuratOBJ$barcode_use <- rownames(SeuratOBJ@meta.data)
+SeuratOBJ$label <- SeuratOBJ@meta.data[,"seurat_clusters"]
+
+output.file = paste0( param$outdir,"/LableForLINGER.txt" )
+write.table(SeuratOBJ@meta.data[,c("barcode_use","label")] , file =output.file , quote = F ,sep ="\t" ,row.names = F )
+
+```
+
+

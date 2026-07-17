@@ -1,0 +1,360 @@
+---
+title: "PreProcess_Seurat"
+subtitle: "Preprocess"
+doc_type: 作業報告書
+author: 株式会社ダイナコム 久世、佐藤、江端
+date: "`r format(Sys.time(), '%Y年%m月%d日')`"
+output:
+    html_document:
+        toc: true
+        toc_depth: 4
+        toc_float:    # 目次は固定にしない
+          collapsed: false
+        number_section: true
+        pandoc_args: ["--from", "markdown+autolink_bare_uris+tex_math_single_backslash-implicit_figures"]
+        self_contained: False
+---
+
+```{=html}
+<!-- 
+sample1
+sample1
+merge
+Integrate
+
+QC & preprocess
+PCA / UMAP / Cluster/ CellCycle / FeatureGene / DEG
+
+-->
+```
+
+<!-- 画像をクリックすると拡大表示するjs -->
+```{js echo=FALSE}
+$(function(){
+  $("img:not(.lb-image)").wrap(function() {
+    return "<a href='" + $(this).attr("src") + "' data-lightbox='" + $(this).attr("scr") + "'></a>";
+  });
+});
+```
+
+## Load Library
+
+```{r setup, include=F ,echo =T}
+setwd("/Analysis/work/")
+
+# ライブラリ読み込み先を指定
+.libPaths()
+knitr::opts_chunk$set(echo = TRUE)
+
+library(monocle3)
+library(Seurat)
+library(SeuratData)
+library(SeuratWrappers)
+library(ggplot2)
+library(patchwork)
+library(magrittr)
+library(dplyr)
+library(tidyverse)
+library(cowplot)
+library(yaml)
+library(DT)
+library(ggplot2)
+library(Polychrome)
+
+set.seed(1234)
+options(future.globals.maxSize = 1e10)
+```
+
+```{r Make color palet , include= FALSE}
+#set.seed(1234)
+palette <- createPalette(20,　seedcolors=  c("#010101", "#ff0000"), M = 1000,prefix="NA")
+names(palette) <- NULL
+# カラーパレットを表示します
+print(palette)
+# カラーパレットを視覚的に確認するためのプロット
+swatch(palette)
+```
+
+## Read YAML
+Parmeterを記載したYAMLファイルの読み込み
+
+```{r ReadYAML, include=FALSE, echo =F}
+# 引数で指定できるように
+yaml_file = "/Analysis/work/work_kuze/conf//seurat_yaml_Marmoset.yaml"
+param <- yaml.load_file(yaml_file)
+```
+
+```{r Print YAML, include=TRUE}
+# outdirがなければ作成
+dir_path <- param$outdir
+# ディレクトリの存在を確認し、存在しない場合は作成
+if (!dir.exists(dir_path)) {
+  dir.create(dir_path, recursive = TRUE)
+  message("ディレクトリを作成しました: ", dir_path)
+} else {
+  message("output ディレクトリは既に存在します: ", dir_path)
+}
+
+#ndim <- eval(parse(text = param$pca_ndim))
+param$pca_ndim <-  eval(parse(text = param$pca_ndim))
+#ndim <- param$pca_ndim <
+param$monocle.useCluster <- eval(parse(text = param$monocle.useCluster))
+print(param)
+```
+
+## Make Function
+
+### makeSeuratOBJ function
+
+```{r makeSeuratOBJ, include=TRUE}
+
+makeSeuratOBJ <-function(param , id ){
+  
+  h5file <- paste0( param$sample[id] ,"/filtered_feature_bc_matrix.h5" )
+  inputdata.10x <- Read10X_h5(h5file)
+  rna_counts <- inputdata.10x$`Gene Expression`
+  SeuratOBJ <- CreateSeuratObject(counts = rna_counts,
+                                   project = param$sampleName[id], 
+                                   min.cells = 0, 
+                                   min.features = 0)
+  #SeuratOBJ[["percent.mt"]] <- PercentageFeatureSet(SeuratOBJ, 
+  #                                                   pattern = "^MT-")
+  SeuratOBJ <- RenameCells(SeuratOBJ,add.cell.id = param$sampleName[id])
+  return(SeuratOBJ)
+}
+
+
+```
+
+## Pre-Process & Integrated
+Batche Effect除去を行い2Sampleを統合解析する。
+まずはSeuratObjを作成しMerge。
+
+```{r make seurat obj, include=TRUE}
+genes <- c("PIWIL4","GFRA1","RHOXF2B","MKI67","DND1","CDKN1B",
+           "POU6F2","ESR1","DPPA4","NANOS2","NANOS3","GFRA1","SFRP1" )
+sample1_OBJ <- makeSeuratOBJ(param=param , id = 1)
+sample2_OBJ <- makeSeuratOBJ(param=param , id = 2)
+merged_obj <- merge(x =sample1_OBJ, y =sample2_OBJ)
+merged_obj$orig.ident <- factor(merged_obj$orig.ident, levels= c(param$sampleName))
+```
+
+### QC plot
+
+検出遺伝子数、検出トランスクリプト数をバイオリンプロットにて確認。
+今回は`r param$CellFilter` でフィルタリング。  *縦軸幅はlogスケール
+
+```{r CellFilter, include=TRUE ,fig.width=4, fig.height=6 }
+p1 <-VlnPlot(merged_obj, features = c("nFeature_RNA", "nCount_RNA") ,
+        group.by= "orig.ident", ncol = 2 , layer = "counts" , log = T,pt.size = 0)
+p1
+#save Plot
+output.file = paste0( param$outdir,"/QCVlnPlot_beforFilter.pdf" )
+ggsave( p1 , file =output.file , height = 4,width = 6 )
+
+
+filteredCell <- rownames(merged_obj@meta.data %>% filter( eval(parse(text = param$CellFilter)) ))
+merged_obj <- subset(merged_obj , cells = filteredCell)
+
+p2 <-VlnPlot(merged_obj, features = c("nFeature_RNA", "nCount_RNA") ,
+        group.by= "orig.ident", ncol = 2, layer = "counts" , log = T,pt.size = 0)
+#save Plot
+p2
+output.file = paste0( param$outdir,"/QCVlnPlot_AfterFilter.pdf" )
+ggsave( p2 , file =output.file , height = 4,width = 6 )
+
+```
+
+前処理として以下の処理を行う。
+・Normalize 
+・Scaling
+・Variable Feature Select (CellCycle 遺伝子除去は`r param$rmCellCycle `  )
+・PCA
+・Clustering
+・UMPA
+
+
+```{r PreProcess , include=TRUE ,fig.width=4, fig.height=5 }
+merged_obj <- NormalizeData(merged_obj)
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+merged_obj <- FindVariableFeatures(merged_obj, 
+                                     selection.method = "vst", 
+                                     nfeatures = param$NumVarFeature )
+all.genes <- rownames(merged_obj)
+merged_obj <- ScaleData(merged_obj, features = all.genes)
+  
+fature_gene = VariableFeatures(merged_obj)
+if ( param$rmCellCycle ){
+  print("remove Cell Cycle gene")
+  fature_gene = VariableFeatures(merged_obj)
+  fature_gene =fature_gene[! fature_gene %in% unlist(cc.genes)]
+  VariableFeatures(merged_obj) = fature_gene
+}
+
+
+merged_obj <- RunPCA(merged_obj , features = fature_gene)
+merged_obj <- IntegrateLayers(object = merged_obj, 
+                              method = RPCAIntegration, 
+                              features = fature_gene,
+                              orig.reduction = "pca", 
+                              new.reduction = "integrated.rpca",
+                              verbose = FALSE)
+
+merged_obj <- FindNeighbors(merged_obj, dims =  param$pca_ndim ,reduction ="integrated.rpca")
+merged_obj <- FindClusters(merged_obj, resolution = param$resolution   )
+merged_obj <- RunUMAP(merged_obj, dims =  param$pca_ndim , reduction ="integrated.rpca")
+
+merged_obj[["joined"]] <- JoinLayers(merged_obj[["RNA"]])
+DefaultAssay(merged_obj) <- "joined"
+merged_obj <- CellCycleScoring(merged_obj,
+                               s.features = s.genes,
+                               g2m.features = g2m.genes, 
+                               set.ident = TRUE)
+Idents(merged_obj) <-"seurat_clusters"
+DefaultAssay(merged_obj) <- "RNA"
+
+# set cluster color
+num_cluster = length(unique(merged_obj$seurat_clusters))
+cluster_pallete <- palette[1:num_cluster ]
+names(cluster_pallete) <- c(0:(num_cluster-1) )
+
+```
+
+
+クラスタごとに検出遺伝子、検出トランスクリプト数を確認。
+
+```{r Cluster Cell QC, include=TRUE ,fig.width=8, fig.height=4 }
+p<-VlnPlot(merged_obj, features = c("nFeature_RNA", "nCount_RNA") , group.by= "seurat_clusters", ncol = 2 ,
+        layer = "counts" , log = T,pt.size = 0 , cols = cluster_pallete)
+p
+output.file = paste0( param$outdir,"/QCVlnPlot_ClusterSummary.pdf" )
+ggsave( p , file =output.file , height = 4,width = 8 )
+
+
+```
+
+
+### Plot UMAP
+
+UMAPにて各クラスタを可視化
+
+```{r Umap Plot, include=TRUE ,fig.width=12, fig.height=6 }
+p1 <- DimPlot(merged_obj, reduction = "umap" ,pt.size=0.1 , cols = cluster_pallete )
+p2 <- DimPlot(merged_obj, reduction = "umap" ,pt.size=0.1 , group.by = "orig.ident", cols = palette)
+p<- p1+p2
+
+p
+output.file = paste0( param$outdir,"/ClusterUMAP.pdf" )
+ggsave( p , file =output.file , height = 5,width = 11 )
+
+p<-DimPlot(merged_obj, reduction = "umap" ,pt.size=0.1 , split.by = "orig.ident", cols = cluster_pallete)
+p
+output.file = paste0( param$outdir,"/Sample_SplitUMAP.pdf" )
+ggsave( p , file =output.file , height = 5,width = 10 )
+
+plot_gene <- c("DND1","PIWIL4","RHOXF2B")
+p<- FeaturePlot(merged_obj, features =plot_gene , ncol=2 , 
+                pt.size = 0.01 ,cols = c("grey", "red") , slot = "data" ) 
+p
+output.file = paste0( param$outdir,"/FeaturePlot_SSCs_Gene.pdf" )
+ggsave( p , file =output.file , height = 7,width = 8 )
+
+```
+
+
+```{r Cell Population Plot, include=TRUE ,fig.width=4, fig.height=6 }
+cluster_cell_num <- table(merged_obj$seurat_clusters, merged_obj$orig.ident)
+output.degfile = paste0( param$outdir,"/Cluster_cell_summary.txt" )
+write.table( cluster_cell_num , file =output.degfile , quote = F ,sep ="\t" ,row.names = T )
+
+cluster_population <- cluster_cell_num %>% 
+  prop.table(margin = 2)
+output.degfile = paste0( param$outdir,"/Cluster_population_summary.txt" )
+write.table( cluster_population , file =output.degfile , quote = F ,sep ="\t" ,row.names = T )
+
+p<-cluster_population %>% 
+  as.data.frame() %>% 
+  rename( Cluster= Var1 , Sample = Var2 ) %>%
+  ggplot( aes(x = Sample, y = Freq, fill = Cluster )) +
+    geom_bar(stat = "identity") +
+    scale_fill_manual( values  =cluster_pallete) +
+    theme_classic() +
+    theme(text = element_text(size = 15) ,axis.text.x = element_text(angle = 45, hjust = 1))  +
+    labs(title = "Cell population", x = "Sample" ,y="Frequency")
+p
+output.file = paste0( param$outdir,"/Barplot_Cluster_population.pdf" )
+ggsave( p , file =output.file , height = 5,width =3 )
+
+
+```
+
+
+
+### Plot CellCycle Score
+CellCycle scoreを可視化
+
+```{r Gene VlnPlot, include=TRUE ,fig.width=12, fig.height=5 }
+p<- FeaturePlot(merged_obj, features = c("S.Score","G2M.Score") , ncol=2 , pt.size = 0.01 ,cols = c("blue","grey", "red") ) 
+p
+output.file = paste0( param$outdir,"/CellCycleScore_Plot_UMAP.pdf" )
+ggsave( p , file =output.file , height = 5,width = 11 )
+
+plot_gene <- c("MKI67","CDKN1B")
+p<- FeaturePlot(merged_obj, features =plot_gene , ncol=2 , 
+                pt.size = 0.01 ,cols = c("grey", "red") , slot = "data" ,max.cutoff = 1) 
+p
+output.file = paste0( param$outdir,"/FeaturePlot_CellCycle_Gene.pdf" )
+ggsave( p , file =output.file , height = 5,width = 11 )
+
+
+```
+
+### Plot PCA
+いくつかの主成分でPlot
+```{r PCAPLOT, include=T ,fig.width=12, fig.height=10 }
+for( i in seq(1,20,2)){
+  l=i+1
+  print(DimPlot(merged_obj, reduction = "integrated.rpca" , dims =c(i,l), cols = palette ))
+}
+
+# 1 ,3 ,5 ,6 ,
+```
+
+
+### Plot VlnPlot
+いくつかの遺伝子の発現をViolin plotで確認。
+
+```{r 1st Sample QC, include=TRUE ,fig.width=12, fig.height=10 }
+genes <- c("PIWIL4","GFRA1","RHOXF2B","MKI67","DND1","CDKN1B",
+           "POU6F2","ESR1","DPPA4","NANOS2","NANOS3","GFRA1","SFRP1" )
+
+p<- VlnPlot(merged_obj, features = genes , group.by = "seurat_clusters", ncol=4 , cols = cluster_pallete, pt.size = 0.1)
+p
+output.file = paste0( param$outdir,"/VlnPlo_representative_Gene.pdf" )
+ggsave( p , file =output.file , height = 10,width = 13 )
+
+```
+
+
+### Plot FeaturePlot
+```{r Gene Featur Plot, include=TRUE ,fig.width=22, fig.height=15 }
+p <- FeaturePlot(merged_obj, features = genes , ncol=4 , pt.size = 0.1 ,cols = c("grey", "red") ) 
+p
+output.file = paste0( param$outdir,"/FeaturePlot_representative_Gene.pdf" )
+ggsave( p , file =output.file , height =15,width = 22 )
+
+```
+
+### seurat convert moncole3
+統合のための前処理
+
+```{r convert Monocle3 OBJ , include=TRUE ,fig.width=12, fig.height=5 }
+DefaultAssay(merged_obj) <-"joined"
+merged_obj[["joined"]] <- as(merged_obj[["joined"]], Class="Assay")
+
+output_rds <-  paste0( param$outdir,"/merged_obj.rds" )
+saveRDS(merged_obj, output_rds)
+
+```

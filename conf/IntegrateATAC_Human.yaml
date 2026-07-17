@@ -1,0 +1,41 @@
+########################
+# PARAM
+########################
+
+# 複数ある場合 mergeかintefrate
+sample:
+  #"/Analysis/work//Cellranger_Result/I7704M_1yr8mnth/outs/"
+  - "/Analysis/work//Cellranger_Result/Human_241125_38yr/"
+
+sampleName:
+  - "Human_241125_38yr"
+
+spedb:
+  "hg38"
+
+numcoler: 20
+colerPalet: "/Analysis/work//out_20250709_hdWGCNA/def.pallet.rds"
+
+### Cluster Param
+ClusterCategory:
+  SSCs: [ 0,1,2,3,5,8,9,10]
+  Differentiation: [4,6,7,11] 
+  rm : [12,13,14]
+
+########################
+# INPUT DIR/FILE
+########################
+directories:
+  CRdir: "/Analysis/work//Cellranger_Result/"
+  gtdir: "/Analysis/work//Ref/Human/"
+  SeuraDir: "/Analysis/work//out_Human_remove45yr/"
+  outdir: "/Analysis/work//work_kuze/result/251029_ATACadd_Human"
+
+files: 
+  gtf:
+    dir: "gtdir"
+    name: "genes.gtf"
+  SeuratOBJ: 
+    dir: "SeuraDir"
+    name: "SeuratOBJ_ForescapePlot.rds"
+

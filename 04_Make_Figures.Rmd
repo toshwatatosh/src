@@ -1,0 +1,1368 @@
+---
+title: "Co-expression Network Analysis"
+subtitle: "Marmoset"
+doc_type: 作業報告書
+author: 株式会社ダイナコム 久世、佐藤、江端
+date: "`r format(Sys.time(), '%Y年%m月%d日')`"
+output:
+    html_document:
+        toc: true
+        toc_depth: 4
+        toc_float:    # 目次は固定にしない
+          collapsed: false
+        number_section: true
+        pandoc_args: ["--from", "markdown+autolink_bare_uris+tex_math_single_backslash-implicit_figures"]
+        self_contained: False
+---
+
+```{=html}
+<!-- 
+sample1
+sample1
+merge
+Integrate
+
+QC & preprocess
+PCA / UMAP / Cluster/ CellCycle / FeatureGene / DEG
+
+-->
+```
+
+<!-- 画像をクリックすると拡大表示するjs -->
+```{js echo=FALSE}
+$(function(){
+  $("img:not(.lb-image)").wrap(function() {
+    return "<a href='" + $(this).attr("src") + "' data-lightbox='" + $(this).attr("scr") + "'></a>";
+  });
+});
+```
+
+## Load Library
+
+```{r setup, include=F ,echo =T}
+setwd("/Analysis/work/")
+
+# ライブラリ読み込み先を指定
+.libPaths()
+knitr::opts_chunk$set(echo = TRUE)
+
+#library(monocle3)
+library(Seurat)
+library(SeuratData)
+library(SeuratDisk)
+library(zellkonverter)
+library(data.table)
+library(SeuratWrappers)
+library(ggplot2)
+library(patchwork)
+library(magrittr)
+library(dplyr)
+library(tidyverse)
+library(cowplot)
+library(yaml)
+library(DT)
+library(ggplot2)
+library(Polychrome)
+# co-expression network analysis packages:
+library(WGCNA)
+library(hdWGCNA)
+library(UCell)
+library(igraph)
+#library(enrichR)
+library(clusterProfiler)
+library(GeneOverlap)
+library(heatmap3)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(biomaRt)
+library(readr)
+library(SeuratObject)
+library(ComplexHeatmap)
+library(patchwork)
+library(scales)
+library(GOSemSim)
+library(Matrix)
+
+library(scCustomize)
+
+
+
+
+enableWGCNAThreads(nThreads = 8)
+
+set.seed(1234)
+options(future.globals.maxSize = 1e12)
+```
+
+```{r Make color palet , include= FALSE}
+#set.seed(1234)
+palette <- createPalette(20,　seedcolors=  c("#010101", "#ff0000"), M = 1000,prefix="NA")
+names(palette) <- NULL
+# カラーパレットを表示します
+print(palette)
+# カラーパレットを視覚的に確認するためのプロット
+swatch(palette)
+
+
+
+```
+
+## 関数定義
+```{r }
+## ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+## UMAP,Feature Plot,Vln Plotを描画する関数
+## ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+plot_graph <- function(seurat_obj, dir_path) {
+  
+  
+  p1 <- DimPlot(seurat_obj,group.by = "cluster_id", label = TRUE, pt.size = 0.5, label.size = 7)
+  output.file <- file.path(dir_path, "integrated_UMAP.pdf")
+  ggsave( p1 , file =output.file , height = 10,width = 12 )
+  
+  
+  p2 <- DimPlot(seurat_obj, group.by = "cluster_id", split.by = "species", label = TRUE, pt.size = 0.5, ncol = 1)
+  output.file <- file.path(dir_path, "species-cluster_UMAP.pdf")
+  ggsave( p2 , file =output.file , height = 10,width = 6 )
+  
+  
+  # 集計：クラスタごとの種別細胞数
+  cluster_species_counts <- seurat_obj@meta.data %>%
+    group_by(seurat_clusters, species) %>%
+    summarise(count = n()) %>%
+    ungroup()
+  
+  # 描画：クラスタごとの種構成を棒グラフで表示
+  p3 <- ggplot(cluster_species_counts, aes(x = factor(seurat_clusters), y = count, fill = species)) +
+    geom_bar(stat = "identity", position = "stack") +
+    labs(x = "Cluster", y = "Cell Count", fill = "Species",
+         title = "Cluster-wise Cell Composition by Species") +
+    theme_minimal()
+  
+  output.file <- file.path(dir_path, "cell_count.pdf")
+  ggsave( p3 , file =output.file , height = 5,width = 8 )
+  
+  
+  # ① 各種の総細胞数を取得
+  species_totals <- table(seurat_obj$species)
+  
+  # ② クラスタ × 種別の細胞数を集計
+  cluster_species_counts <- seurat_obj@meta.data %>%
+    group_by(seurat_clusters, species) %>%
+    summarise(count = n()) %>%
+    ungroup()
+  
+  # ③ 種内比率で正規化
+  cluster_species_counts <- cluster_species_counts %>%
+    mutate(species_total = species_totals[species],
+           normalized = count / species_total)
+  
+  # ④ 描画：種内比率ベースの積み上げ棒グラフ
+  p4 <- ggplot(cluster_species_counts, aes(x = factor(seurat_clusters), y = normalized, fill = species)) +
+    geom_bar(stat = "identity", position = "stack") +
+    labs(x = "Cluster",
+         y = "Normalized Proportion (per species)",
+         fill = "Species",
+         title = "Cluster Composition Normalized by Species Total") +
+    theme_minimal()
+  
+  output.file <- file.path(dir_path, "Normalized_cell_count.pdf")
+  ggsave( p4 , file =output.file , height = 5,width = 8 )
+  
+  
+  
+  p5 <- DimPlot(seurat_obj, group.by = "species", label = TRUE, pt.size = 0.5)
+  output.file <- file.path(dir_path, "species-integrate_UMAP.pdf")
+  ggsave( p5 , file =output.file , height = 10,width = 12 )
+  
+  p6 <- DimPlot(seurat_obj, group.by = "species", split.by = "species", label = FALSE, pt.size = 0.5, ncol = 1)
+  output.file <- file.path(dir_path, "species-split_UMAP.pdf")
+  ggsave( p6 , file =output.file , height = 10,width = 6 )
+  
+  DefaultAssay(seurat_obj) <- "RNA"
+  seurat_obj <- NormalizeData(seurat_obj)
+  
+  
+  p7 <- FeaturePlot(seurat_obj,
+                    features = c("DPPA3", "DPPA4", "GFRA1", "SALL4"),
+                    split.by = "species",
+                    pt.size = 0.2
+                    ) & 
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_blank()
+    )
+
+  output.file <- file.path(dir_path, "feature_plot_group1__1.pdf")
+  ggsave( p7 , file =output.file , height = 10,width = 8 )
+  
+  
+  vln_list <- map(c("DPPA3", "DPPA4", "GFRA1", "SALL4"), ~ VlnPlot(
+    seurat_obj,
+    features = .x,
+    group.by = "seurat_clusters",
+    split.by = "species",
+    pt.size = 0
+  ))
+  
+  output.file <- file.path(dir_path, "vln_plot_group1__1.pdf")
+  
+  p7_1 <- wrap_plots(vln_list, ncol = 1)
+  ggsave(p7_1, file = output.file, height = 10, width = 8)
+
+
+  
+  
+  
+  p8 <- FeaturePlot(seurat_obj,
+                    features = c("ETV5", "ID4" ,"HES1"),
+                    split.by = "species",
+                    pt.size = 0.2
+                    ) & 
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_blank()
+    )
+
+  output.file <- file.path(dir_path, "feature_plot_group1__2.pdf")
+  ggsave( p8 , file =output.file , height = 7.5,width = 8 )
+  
+  vln_list <- map(c("ETV5", "ID4" ,"HES1"), ~ VlnPlot(
+    seurat_obj,
+    features = .x,
+    group.by = "seurat_clusters",
+    split.by = "species",
+    pt.size = 0
+  ))
+  
+  output.file <- file.path(dir_path, "vln_plot_group1__2.pdf")
+  
+  p8_1 <- wrap_plots(vln_list, ncol = 1)
+  ggsave(p8_1, file = output.file, height = 7.5, width = 8)
+  
+  
+
+  
+  
+  
+  p9 <- FeaturePlot(seurat_obj,
+                    features = c("ID4", "HES1"),
+                    split.by = "species",
+                    pt.size = 0.2
+                    ) & 
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_blank()
+    )
+
+  output.file <- file.path(dir_path, "feature_plot_group1_0A.pdf")
+  ggsave( p9 , file =output.file , height = 5,width = 8 )
+  
+  vln_list <- map(c("ID4", "HES1"), ~ VlnPlot(
+    seurat_obj,
+    features = .x,
+    group.by = "seurat_clusters",
+    split.by = "species",
+    pt.size = 0
+  ))
+  
+  output.file <- file.path(dir_path, "vln_plot_group1_0A.pdf")
+  
+  p9_1 <- wrap_plots(vln_list, ncol = 1)
+  ggsave(p9_1, file = output.file, height = 5, width = 8)
+  
+  
+  p10 <- FeaturePlot(seurat_obj,
+                    features = c("ENO3", "A2M", "FGFR3"),
+                    split.by = "species",
+                    pt.size = 0.2
+                    ) & 
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_blank()
+    )
+
+  output.file <- file.path(dir_path, "feature_plot_group0A.pdf")
+  ggsave( p10 , file =output.file , height = 7.5,width = 8 ) 
+  
+  vln_list <- map(c("ENO3", "A2M", "FGFR3"), ~ VlnPlot(
+    seurat_obj,
+    features = .x,
+    group.by = "seurat_clusters",
+    split.by = "species",
+    pt.size = 0
+  ))
+  
+  output.file <- file.path(dir_path, "vln_plot_group0A.pdf")
+  
+  p10_1 <- wrap_plots(vln_list, ncol = 1)
+  ggsave(p10_1, file = output.file, height = 7.5, width = 8)
+  
+  
+  
+  p11 <- FeaturePlot(seurat_obj,
+                    features = c("NANOS2", "DND1", "UTF1", "SPOCD1"),
+                    split.by = "species",
+                    pt.size = 0.2
+                    ) & 
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_blank()
+    )
+
+  output.file <- file.path(dir_path, "feature_plot_group0B.pdf")
+  ggsave( p11 , file =output.file , height = 10,width = 8 )  
+  
+  vln_list <- map(c("NANOS2", "DND1", "UTF1", "SPOCD1"), ~ VlnPlot(
+    seurat_obj,
+    features = .x,
+    group.by = "seurat_clusters",
+    split.by = "species",
+    pt.size = 0
+  ))
+  
+  output.file <- file.path(dir_path, "vln_plot_group0B.pdf")
+  
+  p11_1 <- wrap_plots(vln_list, ncol = 1)
+  ggsave(p11_1, file = output.file, height = 10, width = 8)
+  
+
+  
+  p12 <- FeaturePlot(seurat_obj,
+                    features = c("EGR4", "PIWIL4", "TSPAN33"),
+                    split.by = "species",
+                    pt.size = 0.2
+                    ) & 
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_blank()
+    )
+
+  output.file <- file.path(dir_path, "feature_plot_group0.pdf")
+  ggsave( p12 , file =output.file , height = 7.5,width = 8 )  
+  
+  vln_list <- map(c("EGR4", "PIWIL4", "TSPAN33"), ~ VlnPlot(
+    seurat_obj,
+    features = .x,
+    group.by = "seurat_clusters",
+    split.by = "species",
+    pt.size = 0
+  ))
+  
+  output.file <- file.path(dir_path, "vln_plot_group0.pdf")
+  
+  p12_1 <- wrap_plots(vln_list, ncol = 1)
+  ggsave(p12_1, file = output.file, height = 7.5, width = 8)
+  
+  
+  
+  p13 <- FeaturePlot(seurat_obj,
+                    features = c("KIT", "ZEB2", "NANOS3"),
+                    split.by = "species",
+                    pt.size = 0.2
+                    ) & 
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_blank()
+    )
+
+  output.file <- file.path(dir_path, "feature_plot_differentiation.pdf")
+  ggsave( p13 , file =output.file , height = 7.5,width = 8 ) 
+  
+  
+  vln_list <- map(c("KIT", "ZEB2", "NANOS3"), ~ VlnPlot(
+    seurat_obj,
+    features = .x,
+    group.by = "seurat_clusters",
+    split.by = "species",
+    pt.size = 0
+  ))
+  
+  output.file <- file.path(dir_path, "vln_plot_differentiation.pdf")
+  
+  p13_1 <- wrap_plots(vln_list, ncol = 1)
+  ggsave(p13_1, file = output.file, height = 7.5, width = 8)
+  
+  
+  
+  p<- FeaturePlot(seurat_obj, features = c("S.Score","G2M.Score") , ncol=2 , pt.size = 0.01 ,cols = c("grey", "red") ) 
+  output.file <- file.path(dir_path, "S_G2M_score.pdf")
+
+  ggsave( p , file =output.file , height = 5,width = 11 )
+  
+  plot_gene <- c("MKI67","CDKN1B")
+  p<- FeaturePlot(seurat_obj, features =plot_gene , ncol=2 , 
+                  pt.size = 0.01 ,cols = c("grey", "red") , slot = "data" ,max.cutoff = 1) 
+  p
+  output.file = paste0( dir_path, "/FeaturePlot_CellCycle_Gene.pdf" )
+  ggsave( p , file =output.file , height = 5,width = 11 )
+  
+  
+  
+  
+  
+  
+}
+
+```
+
+
+```{r}
+dir_path <- "/Analysis/work/work_sato/result/out_marge_human_marmoset/integration_condition/nfeatures_2000_method_SCT/UMAP_condition/mindist_0.1_nneighbors_30"
+save_path <- "/Analysis/work/work_sato/result/human_marmoset_graph"
+combined <- readRDS(file.path(dir_path, "combined.rds"))
+```
+
+
+
+
+```{r ReadYAML, include=TRUE}
+
+# ディレクトリの存在を確認し、存在しない場合は作成
+if (!dir.exists(save_path)) {
+  dir.create(save_path, recursive = TRUE)
+  message("ディレクトリを作成しました: ", save_path)
+} else {
+  message("output ディレクトリは既に存在します: ", save_path)
+}
+
+```
+
+
+```{r}
+plot_graph(combined, save_path)
+```
+
+# qualityの確認
+```{r}
+
+human_obj <- readRDS("/Analysis/work/out_Human_remove45yr/SeuratOBJ_ForescapePlot.rds")
+marmoset_obj <- readRDS("/Analysis/work/forPlot_data/SeuratOBJ_Forescape_Marmoset.rds")
+macaque_obj <- readRDS("/Analysis/work/forPlot_data/SeuratOBJ_Forescape_macaque_v2_res0.5_remove_doublet_cluster.rds")
+
+
+DimPlot(combined)
+DefaultAssay(combined) <- "integrated"
+
+human <- subset(combined, species == "human")
+mt_genes_h <- grep("^MT-", rownames(human), value = TRUE)
+mt_counts_h <- Matrix::colSums(human@assays$RNA@layers$counts.1[mt_genes_h, ])
+total_counts_h <- Matrix::colSums(human@assays$RNA@layers$counts.1)
+human$percent.mt <- mt_counts_h / total_counts_h * 100
+
+marmo <- subset(combined, species == "marmoset")
+mt_genes_m <- grep("^mt-", rownames(marmo), value = TRUE)
+mt_counts_m <- Matrix::colSums(marmo@assays$RNA@layers$counts.2[mt_genes_m, ])
+total_counts_m <- Matrix::colSums(marmo@assays$RNA@layers$counts.2)
+marmo$percent.mt <- mt_counts_m / total_counts_m * 100
+
+combined <- merge(human, marmo)
+
+
+p <- ggplot(combined@meta.data,
+       aes(x = seurat_clusters, y = nFeature_RNA, fill = species)) +
+  geom_violin(trim = TRUE, scale = "width") +
+  facet_wrap(~ species, ncol = 1) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_rect(fill = "white")
+  )
+
+output.file <- file.path(save_path, "nFeature_RNA_human_marmoset.pdf")
+ggsave( p , file =output.file , height = 6, width = 8 )
+
+
+
+
+p <- ggplot(combined@meta.data,
+       aes(x = seurat_clusters, y = nCount_RNA, fill = species)) +
+  geom_violin(trim = TRUE, scale = "width") +
+  facet_wrap(~ species, ncol = 1) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_rect(fill = "white")
+  )
+
+output.file <- file.path(save_path, "nCount_RNA_human_marmoset.pdf")
+ggsave( p , file =output.file , height = 6, width = 8 )
+
+
+p <- ggplot(macaque_obj@meta.data,
+       aes(x = seurat_clusters, y = nFeature_RNA, fill = seurat_clusters)) +
+  geom_violin(trim = TRUE, scale = "width") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+output.file <- file.path(save_path, "nFeature_RNA_macaque.pdf")
+ggsave( p , file =output.file , height = 4, width = 8 )
+
+
+p <- ggplot(macaque_obj@meta.data,
+       aes(x = seurat_clusters, y = nCount_RNA, fill = seurat_clusters)) +
+  geom_violin(trim = TRUE, scale = "width") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+output.file <- file.path(save_path, "nCount_RNA_macaque.pdf")
+ggsave( p , file =output.file , height = 4, width = 8 )
+
+
+
+
+```
+
+# Fig1Aのグラフ作成
+```{r}
+p <- DimPlot(combined, label = TRUE, pt.size = 0.5, label.size = 7, cols = palette)+
+  theme(
+    axis.text.x = element_text(size = 11),
+    axis.text.y = element_text(size = 13)
+  )
+
+output.file <- file.path(save_path, "DimPlot_combined.pdf")
+ggsave( p , file =output.file , height = 6, width = 8 )
+
+p <- DimPlot(combined, group.by = "species", split.by = "species",pt.size = 0.5)+
+  theme(
+    axis.text.x = element_text(size = 11),
+    axis.text.y = element_text(size = 13)
+  )
+
+p <- DimPlot(combined, group.by = "species", pt.size = 0.5)+
+  theme(
+    axis.text.x = element_text(size = 11),
+    axis.text.y = element_text(size = 13)
+  )
+
+# 重なりをランダム化
+p <- DimPlot(
+  combined,
+  group.by = "species",
+  pt.size = 0.1,
+  cells = sample(colnames(combined))   # ← ランダムに並び替え
+) +
+  theme(
+    axis.text.x = element_text(size = 11),
+    axis.text.y = element_text(size = 13)
+  )
+
+output.file <- file.path(save_path, "DimPlot_species.pdf")
+ggsave( p , file =output.file , height = 6, width = 8 )
+
+
+```
+
+
+
+
+# Fig1Bのグラフ作成
+```{r}
+DefaultAssay(combined) <- "RNA"
+combined <- NormalizeData(combined)
+
+features <- c("EGR4", "TSPAN33", "PIWIL4" ,"GFRA1", "HES1", "ETV5", "ID4","FGFR3","A2M","NANOS2", "DND1", "SPOCD1", "DPPA3", "DPPA4", "SALL4", "UTF1", "KIT", "ZEB2", "NANOS3", "DNMT3L")
+p <- FeaturePlot(combined,
+                  features = features,
+                  split.by = "species",
+                  pt.size = 0.2
+                  ) &
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank()
+  )
+
+output.file <- file.path(save_path, "FeaturePlot_marker_gene_combined.pdf")
+ggsave( p , file =output.file , height = 42,width = 8 )
+
+
+# 1ページ目
+
+features <- c("NANOS2", "DND1", "SPOCD1", "EGR4", "TSPAN33", "PIWIL4")
+
+p <- FeaturePlot(
+  combined,
+  split.by = "species",
+  features = features,
+  pt.size = 0.001,
+  order = TRUE
+) &scale_color_viridis(option = "turbo", alpha = 0.8) & 
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x  = element_blank(),
+    axis.text.y  = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.line = element_blank()
+  ) &
+  theme(legend.position = "none")   # ← レジェンドを消す
+
+output.file <- file.path(save_path, "FeaturePlot_marker_gene.pdf")
+ggsave(p, file = output.file, height = 10, width = 6, dpi = 600)
+
+
+
+p <- FeaturePlot(
+  combined,
+  split.by = "species",
+  features = features,
+  pt.size = 0.001,
+  order = FALSE
+) &
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x  = element_blank(),
+    axis.text.y  = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.line = element_blank()
+  ) &
+  theme(legend.position = "none")   # ← レジェンドを消す
+
+output.file <- file.path(save_path, "FeaturePlot_marker_gene.pdf")
+ggsave(p, file = output.file, height = 10, width = 6, dpi = 600)
+
+
+marmoset_only_obj <- subset(combined, species == "marmoset")
+features <- c("EGR4", "PIWIL4", "HES1")
+
+# 発現行列を取得（data slot）
+mat <- GetAssayData(marmoset_only_obj, slot = "data")[features, ]
+
+# 発現している細胞（>0）を TRUE/FALSE で判定
+expr_binary <- mat > 0
+
+# 各遺伝子の発現割合を計算
+percent_expr <- colMeans(t(expr_binary)) * 100
+
+percent_expr
+
+
+
+
+
+```
+
+```{r}
+library(Seurat)
+library(ggplot2)
+
+# --- マーカー遺伝子の指定 ---
+features <- c("EGR4", "TSPAN33", "PIWIL4", "FGFR3","A2M", "GFRA1", "HES1", "ETV5", "ID4","NANOS2", "DND1", "SPOCD1", "DPPA3", "DPPA4", "SALL4", "UTF1", "KIT", "ZEB2", "NANOS3", "ZPBP", "PRM2", "VIM", "INSL3", "ACTA2", "IL1B","MKI67","CDKN1A","CDKN1B","CDKN1C")
+
+DefaultAssay(combined) <- "RNA"
+
+# --- グループラベルの定義 ---
+group_labels <- c(
+  rep("State 0", 3),
+  rep("State 0A",2),
+  rep("State 1", 4),
+  rep("State 0B", 3),
+  rep("Stem cell", 4),
+  rep("Differentiation", 3),
+  "Spermatocyte", "Spermatid",
+  "Somatic cells", "Leydig cell", "Myoid", "Macrophage","proliferating", rep("dormant",3)
+)
+
+# --- 共通描画関数 ---
+make_dotplot <- function(seurat_obj, features, group_labels, title = NULL) {
+  dot <- DotPlot(seurat_obj, features = features, cols = c("lightgrey", "red"))
+  
+  gene_levels <- levels(dot$data$features.plot)
+  cell_levels <- levels(dot$data$id)
+  
+  dot$data$group <- factor(group_labels, levels = unique(group_labels))
+  dot$data$gene  <- factor(dot$data$features.plot, levels = gene_levels)
+  
+  group_tile <- unique(dot$data[, c("gene", "group")])
+  group_tile$id <- "GroupBand"
+  
+  y_levels <- c("GroupBand", cell_levels)
+  y_labels <- c("GroupBand" = "", setNames(cell_levels, cell_levels))
+  
+  p <- ggplot(dot$data, aes(x = gene, y = id)) +
+    geom_tile(data = group_tile, aes(x = gene, y = id, fill = group), height = 0.8) +
+    geom_point(aes(size = pct.exp, color = avg.exp.scaled)) +
+    scale_y_discrete(limits = y_levels, labels = y_labels) +
+    scale_color_gradient(low = "lightgrey", high = "red") +
+    scale_fill_manual(values = c(
+      "State 0"        = "#F8766D",
+      "State 0A"       = "#D89000",
+      "State 1"        = "#E69F00",
+      "State 0B"       = "#A3A500",
+      "Stem cell"      = "#39B600",
+      "Differentiation"= "#00BF7D",
+      "Spermatocyte"   = "#00BFC4",
+      "Spermatid"      = "#00B0F6",
+      "Somatic cells"  = "#9590FF",
+      "Leydig cell"    = "#E76BF3",
+      "Myoid"          = "#FF62BC",
+      "Macrophage"     = "#B79F00",
+      "proliferating"  = "#7CAE00",
+      "dormant"        = "#C77CFF"
+    ))+
+    guides(
+      color = guide_colorbar(title = "avg.exp.scaled", order = 1),
+      size  = guide_legend(title = "pct.exp", order = 2),
+      fill  = guide_legend(title = "Gene group", override.aes = list(shape = 22), order = 3)
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(size = 11, angle = 315, hjust = 0),
+      axis.text.y = element_text(size = 13),
+      legend.position = "right"
+    ) +
+    labs(x = "Gene", y = "Cluster", title = title)
+  
+  return(p)
+}
+
+# --- combined全体 ---
+p_combined <- make_dotplot(combined, features, group_labels, title = "Combined (Human + Marmoset)")
+ggsave(p_combined, file = file.path(save_path, "DotPlot_combined.pdf"), height = 8, width = 12)
+
+# --- Humanのみ ---
+combined_human <- subset(combined, subset = species == "human")
+combined_human <- NormalizeData(combined_human)
+p_human <- make_dotplot(combined_human, features, group_labels, title = "Human")
+output.file <- file.path(save_path, "DotPlot_marker_gene_combined_human.pdf")
+ggsave(p_human, file = output.file, height = 8, width = 12)
+
+# --- Marmosetのみ ---
+combined_marmoset <- subset(combined, subset = species == "marmoset")
+combined_marmoset <- NormalizeData(combined_marmoset)
+p_marmoset <- make_dotplot(combined_marmoset, features, group_labels, title = "Marmoset")
+output.file <- file.path(save_path, "DotPlot_marker_gene_combined_marmoset.pdf")
+ggsave(p_marmoset, file = output.file, height = 8, width = 12)
+
+
+# --- Macaqueのみ ---
+
+
+group_labels <- c(
+  rep("State 0", 3),
+  rep("State 0A",1),
+  rep("State 1", 4),
+  rep("State 0B", 3),
+  rep("Stem cell", 2),
+  rep("Differentiation", 2),
+  "Spermatocyte", "Spermatid",
+  "Somatic cells", "Leydig cell", "Myoid", "Macrophage","proliferating", rep("dormant",3)
+)   
+
+
+macaque_obj <- NormalizeData(macaque_obj)
+p_human <- make_dotplot(macaque_obj, features, group_labels, title = "macaque")
+output.file <- file.path(save_path, "DotPlot_marker_gene_macaque.pdf")
+ggsave(p_human, file = output.file, height = 8, width = 12)
+```
+
+# Fig1Cのグラフ作成
+```{r}
+
+features <- c("EGR4", "TSPAN33", "PIWIL4" ,"GFRA1", "HES1", "ETV5", "ID4","FGFR3","A2M","NANOS2", "DND1", "SPOCD1", "DPPA3", "DPPA4", "SALL4", "UTF1", "KIT", "ZEB2", "NANOS3", "ZPBP", "PRM2", "VIM", "INSL3", "ACTA2", "IL1B","MKI67","CDKN1A","CDKN1B","CDKN1C")
+DefaultAssay(combined) <- "RNA"
+
+group_labels <- c(
+  rep("State 0", 3),
+  rep("State 0A/1", 6),
+  rep("State 0B", 3),
+  rep("Stem cell", 4),
+  rep("Differentiation", 3),
+  "Spermatocyte", "Spermatid",
+  "Somatic cells", "Leydig cell", "Myoid", "Macrophage","proliferating", rep("dormant",3)
+)
+
+
+
+# DotPlot の作成
+dot <- DotPlot(combined, features = features, cols = c("lightgrey", "red"))
+
+# 遺伝子順と細胞群順を取得
+gene_levels <- levels(dot$data$features.plot)
+cell_levels <- levels(dot$data$id)
+
+# グループ情報を結合
+dot$data$group <- factor(group_labels, levels = unique(group_labels))
+dot$data$gene <- factor(dot$data$features.plot, levels = gene_levels)
+
+# グループ帯データ（1遺伝子1行）
+group_tile <- unique(dot$data[, c("gene", "group")])
+group_tile$id <- "GroupBand"  # ダミーy軸ラベル
+
+# y軸ラベルにダミーを追加（下に表示されるように）
+y_levels <- c("GroupBand", cell_levels)
+y_labels <- c("GroupBand" = "", setNames(cell_levels, cell_levels))
+
+# プロット再構築
+p <- ggplot(dot$data, aes(x = gene, y = id)) +
+  geom_tile(data = group_tile, aes(x = gene, y = id, fill = group), height = 0.8) +
+  geom_point(aes(size = pct.exp, color = avg.exp.scaled)) +
+  scale_y_discrete(limits = y_levels, labels = y_labels) +
+  scale_color_gradient(low = "lightgrey", high = "red") +
+  scale_fill_manual(values = c(
+    "State 0"        = "#F8766D",
+    "State 0A/1"     = "#D89000",
+    "State 0B"       = "#A3A500",
+    "Stem cell"      = "#39B600",
+    "Differentiation"= "#00BF7D",
+    "Spermatocyte"   = "#00BFC4",
+    "Spermatid"      = "#00B0F6",
+    "Somatic cells"  = "#9590FF",
+    "Leydig cell"    = "#E76BF3",
+    "Myoid"          = "#FF62BC",
+    "Macrophage"     = "#B79F00",
+    "proliferating"  = "#7CAE00",   
+    "dormant"        = "#C77CFF"  
+  )) +
+  guides(
+    color = guide_colorbar(title = "avg.exp.scaled", order = 1),
+    size  = guide_legend(title = "pct.exp", order = 2),
+    fill  = guide_legend(title = "Gene group", override.aes = list(shape = 22), order = 3)
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 11, angle = 315, hjust = 0),
+    axis.text.y = element_text(size = 13),
+    legend.position = "right"
+  ) +
+  labs(x = "Gene", y = "Cluster")
+
+
+
+output.file <- file.path(save_path, "DotPlot_marker_gene.pdf")
+ggsave( p , file =output.file , height = 8,width = 12 )
+
+
+# humanのみのDotPlot
+combined_human <- subset(combined, subset = species == "human")
+combined_human <- NormalizeData(combined_human)
+dot_human <- DotPlot(combined_human, features = features, cols = c("lightgrey", "red")) +
+  ggtitle("Human")
+
+
+
+```
+
+
+# Fig1Dのグラフ作成
+```{r}
+
+DefaultAssay(combined) <- "SCT"
+
+p <- FeaturePlot(combined, split.by = "species", features = c("S.Score","G2M.Score") , ncol=2 , pt.size = 0.01 ,cols = c("blue","grey", "red") )+
+    theme(
+      axis.text.x = element_text(size = 11),
+      axis.text.y = element_text(size = 13)
+    )
+output.file <- file.path(save_path, "FeaturePlot_cell_cycle_score_species.pdf")
+ggsave( p , file =output.file , height = 8,width = 8 )
+
+
+p <- FeaturePlot(combined, split.by = "species", features = c("MKI67","CDKN1A","CDKN1B","CDKN1C") , ncol=2 , pt.size = 0.01 ,cols = c("grey", "red") )+
+    theme(
+      axis.text.x = element_text(size = 11),
+      axis.text.y = element_text(size = 13)
+    )
+output.file <- file.path(save_path, "FeaturePlot_cell_cycle_gene_species.pdf")
+ggsave( p , file =output.file , height = 15,width = 8 )
+
+
+p <- FeaturePlot(combined, features = c("S.Score","G2M.Score") , ncol=2 , pt.size = 0.01 ,cols = c("blue", "grey", "red") )+
+    theme(,
+      axis.text.x = element_text(size = 11),
+      axis.text.y = element_text(size = 13)
+    )
+output.file <- file.path(save_path, "FeaturePlot_cell_cycle_score_combined.pdf")
+ggsave( p , file =output.file , height = 4.5,width = 10 )
+
+
+p <- FeaturePlot(combined, features = c("MKI67","CDKN1A","CDKN1B","CDKN1C") , ncol=2 , pt.size = 0.01 ,cols = c("grey", "red") )+
+    theme(
+      axis.text.x = element_text(size = 11),
+      axis.text.y = element_text(size = 13)
+    )
+output.file <- file.path(save_path, "FeaturePlot_cell_cycle_gene_combined.pdf")
+ggsave( p , file =output.file , height = 8,width = 10 )
+
+```
+
+###########
+# 生物種個別に描画
+###########
+
+
+```{r}
+human_obj <- readRDS("/Analysis/work/out_Human_remove45yr/SeuratOBJ_ForescapePlot.rds")
+marmoset_obj <- readRDS("/Analysis/work/forPlot_data/SeuratOBJ_Forescape_Marmoset.rds")
+macaque_obj <- readRDS("/Analysis/work/forPlot_data/SeuratOBJ_Forescape_macaque_v2_res0.5_remove_doublet_cluster.rds")
+
+species_list <- list(human = human_obj, marmoset = marmoset_obj, macaque = macaque_obj)
+
+```
+
+# Fig1Aのグラフ作成
+```{r}
+for (species in names(species_list)) {
+  obj <- species_list[[species]]
+  p <- DimPlot(obj, label = TRUE, pt.size = 0.5, label.size = 7, cols = palette)+
+    theme(
+      axis.text.x = element_text(size = 11),
+      axis.text.y = element_text(size = 13)
+    )
+  
+  output.file <- file.path(save_path, paste0("DimPlot", "_", species,".pdf"))
+  ggsave( p , file =output.file , height = 6, width = 8 )
+  
+  }
+
+```
+
+
+# Fig1Bのグラフ作成
+```{r}
+
+for (species in names(species_list)) {
+  obj <- species_list[[species]]
+
+  DefaultAssay(obj) <- "RNA"
+  obj <- NormalizeData(obj)
+  features <- c("EGR4", "TSPAN33", "PIWIL4" ,"GFRA1", "HES1", "ETV5", "ID4","FGFR3","A2M","NANOS2", "DND1", "SPOCD1", "DPPA3", "DPPA4", "SALL4", "UTF1", "KIT", "ZEB2", "NANOS3", "DNMT3L")
+
+  p <- FeaturePlot(obj,
+                    features = features,
+                    pt.size = 0.2,
+                    ncol = 2
+                    ) & 
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_blank()
+    )
+  
+  output.file <- file.path(save_path, paste0("FeaturePlot_marker_gene_",species,".pdf"))
+  ggsave( p , file =output.file , height = 22.5,width = 8 )
+}
+```
+
+
+
+# Fig1Bのグラフ(マカク)作成
+```{r}
+
+obj <- species_list[["macaque"]]
+
+DefaultAssay(obj) <- "RNA"
+obj <- NormalizeData(obj)
+
+features <- c("HES1","SPOCD1","KIT", "ETV5","EGR4","ZEB2", "ID4","TSPAN33","NANOS3","UTF1","SALL4", "DPPA4","RHOXF1","YBX3","ZBTB16","SALL4","NKX6-2","ZNF395","MLLT6","POU3F1","BARHL2","SOX9", "ARID5B")
+p <- FeaturePlot(obj,
+                  features = features,
+                  pt.size = 0.2,
+                  ncol = 3
+                  ) & 
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x  = element_blank(),
+    axis.text.y  = element_blank(),
+    axis.ticks   = element_blank(),
+    axis.line    = element_blank(),
+    panel.border = element_blank(),
+    panel.grid   = element_blank(),
+    legend.position = "none"  # ← 凡例を消す
+  )
+output.file <- file.path(save_path, paste0("FeaturePlot_marker_gene_macaque.pdf"))
+ggsave( p , file =output.file , height = 18.5,width = 8 )
+
+```
+
+# Fig1Cのグラフ作成
+```{r}
+
+features <- c("EGR4", "TSPAN33", "PIWIL4" ,"GFRA1", "HES1", "ETV5", "ID4","FGFR3","A2M","NANOS2", "DND1", "SPOCD1", "DPPA3", "DPPA4", "SALL4", "UTF1", "KIT", "ZEB2", "NANOS3", "ZPBP", "PRM2", "VIM", "INSL3", "ACTA2", "IL1B","MKI67","CDKN1A","CDKN1B","CDKN1C")
+
+for (species in names(species_list)) {
+  obj <- species_list[[species]]
+  DefaultAssay(obj) <- "RNA"
+  obj <- NormalizeData(obj)
+
+  DefaultAssay(obj) <- "RNA"
+  
+  group_labels <- c(
+    rep("State 0", 3),
+    rep("State 0A/1", 6),
+    rep("State 0B", 3),
+    rep("Stem cell", 4),
+    rep("Differentiation", 3),
+    "Spermatocyte", "Spermatid",
+    "Somatic cells", "Leydig cell", "Myoid", "Macrophage","proliferating", rep("dormant",3)
+  )
+  
+  if (species == "macaque"){
+    group_labels <- c(
+      rep("State 0", 3),
+      rep("State 0A/1", 5),
+      rep("State 0B", 3),
+      rep("Stem cell", 2),
+      rep("Differentiation", 3),
+      "Spermatid",
+      "Somatic cells", "Leydig cell", "Myoid", "Macrophage"
+    )    
+  }
+  
+  # DotPlot の作成
+  dot <- DotPlot(obj, features = features, cols = c("lightgrey", "red"))
+  
+  # 遺伝子順と細胞群順を取得
+  gene_levels <- levels(dot$data$features.plot)
+  cell_levels <- levels(dot$data$id)
+  
+  # グループ情報を結合
+  dot$data$group <- factor(group_labels, levels = unique(group_labels))
+  dot$data$gene <- factor(dot$data$features.plot, levels = gene_levels)
+  
+  # グループ帯データ（1遺伝子1行）
+  group_tile <- unique(dot$data[, c("gene", "group")])
+  group_tile$id <- "GroupBand"  # ダミーy軸ラベル
+  
+  # y軸ラベルにダミーを追加（下に表示されるように）
+  y_levels <- c("GroupBand", cell_levels)
+  y_labels <- c("GroupBand" = "", setNames(cell_levels, cell_levels))
+  
+  # プロット再構築
+  p <- ggplot(dot$data, aes(x = gene, y = id)) +
+    geom_tile(data = group_tile, aes(x = gene, y = id, fill = group), height = 0.8) +
+    geom_point(aes(size = pct.exp, color = avg.exp.scaled)) +
+    scale_y_discrete(limits = y_levels, labels = y_labels) +
+    scale_color_gradient(low = "lightgrey", high = "red") +
+    scale_fill_manual(values = c(
+      "State 0"        = "#F8766D",
+      "State 0A/1"     = "#D89000",
+      "State 0B"       = "#A3A500",
+      "Stem cell"      = "#39B600",
+      "Differentiation"= "#00BF7D",
+      "Spermatocyte"   = "#00BFC4",
+      "Spermatid"      = "#00B0F6",
+      "Somatic cells"  = "#9590FF",
+      "Leydig cell"    = "#E76BF3",
+      "Myoid"          = "#FF62BC",
+      "Macrophage"     = "#B79F00",
+      "proliferating"  = "#7CAE00",   
+      "dormant"        = "#C77CFF"  
+    ))  +
+    guides(
+      color = guide_colorbar(title = "avg.exp.scaled", order = 1),
+      size  = guide_legend(title = "pct.exp", order = 2),
+      fill  = guide_legend(title = "Gene group", override.aes = list(shape = 22), order = 3)
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(size = 11, angle = 315, hjust = 0),
+      axis.text.y = element_text(size = 13),
+      legend.position = "right"
+    ) +
+    labs(x = "Gene", y = "Cluster")
+  
+  output.file <- file.path(save_path, paste0("DotPlot_marker_gene_",species,".pdf"))
+  ggsave( p , file =output.file , height = 8,width = 12 )
+}
+
+```
+# Fig1Dのグラフ作成
+```{r}
+
+for (species in names(species_list)) {
+  obj <- species_list[[species]]
+  
+  s.genes <- cc.genes$s.genes
+  g2m.genes <- cc.genes$g2m.genes
+  DefaultAssay(obj) <- "RNA"
+  obj <- NormalizeData(obj)
+  
+  obj <- CellCycleScoring(obj,
+                          s.features = s.genes,
+                          g2m.features = g2m.genes, 
+                          set.ident = TRUE)
+
+  p <- FeaturePlot(obj, features = c("S.Score","G2M.Score") , ncol=2 , pt.size = 0.01 ,cols = c("blue", "grey", "red") )+
+      theme(
+        axis.text.x = element_text(size = 11),
+        axis.text.y = element_text(size = 13)
+      )
+  
+  output.file <- file.path(save_path, paste0("FeaturePlot_cell_cycle_score_",species,".pdf"))
+  ggsave( p , file =output.file , height = 4.5,width = 10 )
+  
+  
+  
+    p <- FeaturePlot(obj, features = c("MKI67","CDKN1A","CDKN1B","CDKN1C") , ncol=2 , pt.size = 0.01 ,cols = c("grey", "red") )+
+      theme(
+        axis.text.x = element_text(size = 11),
+        axis.text.y = element_text(size = 13)
+      )
+  
+  output.file <- file.path(save_path, paste0("FeaturePlot_cell_cycle_gene_",species,".pdf"))
+  ggsave( p , file =output.file , height = 9,width = 10 )
+  
+}
+
+```
+
+#####################
+# BrdUグラフ作成
+####################
+
+```{r}
+library(zoo)
+
+save_dir <- "/Analysis/work/work_sato/result/brdu"
+data_dir <- "/Analysis/work/data/brdu"
+
+
+##################
+# marmoset1
+##################
+data_path <- file.path(data_dir, "marmoset1.csv")
+
+df <- read.csv(data_path, header = TRUE, check.names = FALSE)
+
+# long形式に変換
+df_long <- pivot_longer(df, cols = c(`DND1(+)`,`PIWIL4(+)`,`DPPA4(+)`),
+                        names_to = "Gene", values_to = "Percent")
+
+# Geneごとに線形補間
+df_long_interp <- df_long %>%
+  group_by(Gene) %>%
+  mutate(Percent_interp = na.approx(Percent, x = week, na.rm = FALSE),
+         is_imputed = is.na(Percent))  # 補間されたかどうかを記録
+
+p <- ggplot(df_long_interp, aes(x = week)) +
+  geom_line(aes(y = Percent_interp), color = "#333333", size = 1.2) +
+  geom_point(
+    data = subset(df_long_interp, !is_imputed),  # 補間されていない元データのみ
+    aes(y = Percent_interp),
+    color = "#333333", fill = "white", shape = 21, size = 3
+  ) +
+  facet_grid(Gene ~ ., scales = "fixed", switch = "y") +
+  scale_y_continuous(limits = c(0, 100)) +
+  scale_x_continuous(limits = c(-1, max(df_long$week))) +
+  theme_minimal(base_size = 12) +
+  theme(panel.border = element_rect(color = "grey70", fill = NA, size = 1),
+        strip.placement = "outside") +
+  labs(x = "Week", y = "", title = "")
+
+print(p)
+
+output.file <- file.path(save_dir, "Brdu_marmoset1.pdf")
+ggsave( p , file =output.file , height = 7,width = 10 )
+
+
+##################
+# marmoset2
+##################
+data_path <- file.path(data_dir, "marmoset2.csv")
+
+df <- read.csv(data_path, header = TRUE, check.names = FALSE)
+
+# long形式に変換
+df_long <- pivot_longer(df, cols = c(`DND1(+)`,`PIWIL4(+) DPPA4(-)`,`PIWIL4(+) DPPA4(+)`),
+                        names_to = "Gene", values_to = "Percent")
+
+# Geneごとに線形補間
+df_long_interp <- df_long %>%
+  group_by(Gene) %>%
+  mutate(Percent_interp = na.approx(Percent, x = week, na.rm = FALSE),
+         is_imputed = is.na(Percent))  # 補間されたかどうかを記録
+
+p <- ggplot(df_long_interp, aes(x = week)) +
+  geom_line(aes(y = Percent_interp), color = "#333333", size = 1.2) +
+  geom_point(
+    data = subset(df_long_interp, !is_imputed),  # 補間されていない元データのみ
+    aes(y = Percent_interp),
+    color = "#333333", fill = "white", shape = 21, size = 3
+  ) +
+  facet_grid(Gene ~ ., scales = "fixed", switch = "y") +
+  scale_y_continuous(limits = c(0, 100)) +
+  scale_x_continuous(limits = c(-1, max(df_long$week))) +
+  theme_minimal(base_size = 12) +
+  theme(panel.border = element_rect(color = "grey70", fill = NA, size = 1),
+        strip.placement = "outside") +
+  labs(x = "Week", y = "", title = "")
+
+print(p)
+
+output.file <- file.path(save_dir, "Brdu_marmoset2.pdf")
+ggsave( p , file =output.file , height = 7,width = 10 )
+
+
+
+
+##################
+# macaque1
+##################
+data_path <- file.path(data_dir, "macaque1.csv")
+
+df <- read.csv(data_path, header = TRUE, check.names = FALSE)
+
+
+
+# long形式に変換
+df_long <- pivot_longer(df, cols = c(`DNMT3L(+)`,`DND1(+)`,`PIWIL4(+)`),
+                        names_to = "Gene", values_to = "Percent")
+
+# Geneごとに線形補間
+df_long_interp <- df_long %>%
+  group_by(Gene) %>%
+  mutate(Percent_interp = na.approx(Percent, x = week, na.rm = FALSE),
+         is_imputed = is.na(Percent))  # 補間されたかどうかを記録
+
+p <- ggplot(df_long_interp, aes(x = week)) +
+  geom_line(aes(y = Percent_interp), color = "#333333", size = 1.2) +
+  geom_point(
+    data = subset(df_long_interp, !is_imputed),  # 補間されていない元データのみ
+    aes(y = Percent_interp),
+    color = "#333333", fill = "white", shape = 21, size = 3
+  ) +
+  facet_grid(Gene ~ ., scales = "fixed", switch = "y") +
+  scale_y_continuous(limits = c(0, 100)) +
+  scale_x_continuous(limits = c(-1, max(df_long$week))) +
+  theme_minimal(base_size = 12) +
+  theme(panel.border = element_rect(color = "grey70", fill = NA, size = 1),
+        strip.placement = "outside") +
+  labs(x = "Week", y = "", title = "")
+
+print(p)
+
+output.file <- file.path(save_dir, "Brdu_macaque1.pdf")
+ggsave( p , file =output.file , height = 7,width = 10 )
+
+
+
+##################
+# macaque2
+##################
+data_path <- file.path(data_dir, "macaque2.csv")
+
+df <- read.csv(data_path, header = TRUE, check.names = FALSE)
+
+
+
+# long形式に変換
+df_long <- pivot_longer(df, cols = c(`PIWIL4(-) DNMT3L(+)`,`PIWIL4(+) DNMT3L(+)`,`PIWIL4(+) DNMT3L(-)`),
+                        names_to = "Gene", values_to = "Percent")
+
+# Geneごとに線形補間
+df_long_interp <- df_long %>%
+  group_by(Gene) %>%
+  mutate(Percent_interp = na.approx(Percent, x = week, na.rm = FALSE),
+         is_imputed = is.na(Percent))  # 補間されたかどうかを記録
+
+p <- ggplot(df_long_interp, aes(x = week)) +
+  geom_line(aes(y = Percent_interp), color = "#333333", size = 1.2) +
+  geom_point(
+    data = subset(df_long_interp, !is_imputed),  # 補間されていない元データのみ
+    aes(y = Percent_interp),
+    color = "#333333", fill = "white", shape = 21, size = 3
+  ) +
+  facet_grid(Gene ~ ., scales = "fixed", switch = "y") +
+  scale_y_continuous(limits = c(0, 100)) +
+  scale_x_continuous(limits = c(-1, max(df_long$week))) +
+  theme_minimal(base_size = 12) +
+  theme(panel.border = element_rect(color = "grey70", fill = NA, size = 1),
+        strip.placement = "outside") +
+  labs(x = "Week", y = "", title = "")
+
+print(p)
+
+output.file <- file.path(save_dir, "Brdu_macaque2.pdf")
+ggsave( p , file =output.file , height = 7,width = 10 )
+
+
+
+##################
+# macaque_accumulation
+##################
+data_path <- file.path(data_dir, "macaque_accumulation.csv")
+df <- read.csv(data_path, header = TRUE, check.names = FALSE)
+
+df <- df %>% 
+  dplyr::filter(week <= 14)
+
+
+
+# long形式に変換
+df_long <- pivot_longer(df, cols = c(`DND1(+)`,`PIWIL4(+)`),
+                        names_to = "Gene", values_to = "Percent")
+
+# Geneごとに線形補間
+df_long_interp <- df_long %>%
+  group_by(Gene) %>%
+  mutate(Percent_interp = na.approx(Percent, x = week, na.rm = FALSE),
+         is_imputed = is.na(Percent))  # 補間されたかどうかを記録
+
+p <- ggplot(df_long_interp, aes(x = week)) +
+  geom_line(aes(y = Percent_interp), color = "#333333", size = 1.2) +
+  geom_point(
+    data = subset(df_long_interp, !is_imputed),  # 補間されていない元データのみ
+    aes(y = Percent_interp),
+    color = "#333333", fill = "white", shape = 21, size = 3
+  ) +
+  facet_grid(Gene ~ ., scales = "fixed", switch = "y") +
+  scale_y_continuous(limits = c(0, 100)) +
+  scale_x_continuous(limits = c(-1, max(df_long$week))) +
+  theme_minimal(base_size = 12) +
+  theme(panel.border = element_rect(color = "grey70", fill = NA, size = 1),
+        strip.placement = "outside") +
+  labs(x = "Week", y = "", title = "")
+
+print(p)
+
+output.file <- file.path(save_dir, "Brdu_macaque_accumulation.pdf")
+ggsave( p , file =output.file , height = 5,width = 10 )
+
+
+##################
+# marmoset_accumulation
+##################
+data_path <- file.path(data_dir, "marmoset_accumulation.csv")
+df <- read.csv(data_path, header = TRUE, check.names = FALSE)
+
+df <- df %>% 
+  dplyr::filter(week <= 13)
+
+
+
+# long形式に変換
+df_long <- pivot_longer(df, cols = c(`DND1(+)`,`PIWIL4(+)`),
+                        names_to = "Gene", values_to = "Percent")
+
+# Geneごとに線形補間
+df_long_interp <- df_long %>%
+  group_by(Gene) %>%
+  mutate(Percent_interp = na.approx(Percent, x = week, na.rm = FALSE),
+         is_imputed = is.na(Percent))  # 補間されたかどうかを記録
+
+p <- ggplot(df_long_interp, aes(x = week)) +
+  geom_line(aes(y = Percent_interp), color = "#333333", size = 1.2) +
+  geom_point(
+    data = subset(df_long_interp, !is_imputed),  # 補間されていない元データのみ
+    aes(y = Percent_interp),
+    color = "#333333", fill = "white", shape = 21, size = 3
+  ) +
+  facet_grid(Gene ~ ., scales = "fixed", switch = "y") +
+  scale_y_continuous(limits = c(0, 100)) +
+  scale_x_continuous(limits = c(-1, max(df_long$week))) +
+  theme_minimal(base_size = 12) +
+  theme(panel.border = element_rect(color = "grey70", fill = NA, size = 1),
+        strip.placement = "outside") +
+  labs(x = "Week", y = "", title = "")
+
+print(p)
+
+output.file <- file.path(save_dir, "Brdu_marmoset_accumulation.pdf")
+ggsave( p , file =output.file , height = 5,width = 10 )
+
+
+
+```
+
+

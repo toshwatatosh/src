@@ -1,0 +1,2815 @@
+---
+title: "Pseudotime Cluster"
+subtitle: "Marmoset"
+doc_type: 作業報告書
+author: 株式会社ダイナコム 久世、佐藤、江端
+date: "`r format(Sys.time(), '%Y年%m月%d日')`"
+output:
+    html_document:
+        toc: true
+        toc_depth: 4
+        toc_float:    # 目次は固定にしない
+          collapsed: false
+        number_section: true
+        pandoc_args: ["--from", "markdown+autolink_bare_uris+tex_math_single_backslash-implicit_figures"]
+        self_contained: False
+---
+
+```{=html}
+<!-- 
+sample1
+sample1
+merge
+Integrate
+
+QC & preprocess
+PCA / UMAP / Cluster/ CellCycle / FeatureGene / DEG
+
+-->
+```
+<!-- 画像をクリックすると拡大表示するjs -->
+
+```{js echo=FALSE}
+$(function(){
+  $("img:not(.lb-image)").wrap(function() {
+    return "<a href='" + $(this).attr("src") + "' data-lightbox='" + $(this).attr("scr") + "'></a>";
+  });
+});
+```
+
+## Load Library
+
+```{r setup, include=F ,echo =T}
+setwd("/Analysis/work/")
+
+# ライブラリ読み込み先を指定
+.libPaths()
+knitr::opts_chunk$set(echo = TRUE)
+
+# BioInfo Toll
+library(Seurat)
+library(SeuratData)
+library(SeuratWrappers)
+library(Signac)
+library(GenomicRanges)
+library(BSgenome.Cjacchus.UCSC.calJac4)
+library(clusterProfiler)
+library(GeneOverlap)
+library(SCENT);
+library(Pando)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(chromVAR)
+library(motifmatchr)
+library(SummarizedExperiment)
+
+# Rstatics
+library(MyEllipsefit)
+library(gam)
+library(dtwclust)
+library(glassoFast)
+library(princurve)
+
+# R utilitu
+library(magrittr)
+library(dplyr)
+library(tidyverse)
+library(yaml)
+library(DT)
+library(igraph)
+library(ggraph)
+library(gridExtra)
+#library(Matrix)
+library(tidygraph)
+library(openxlsx)
+
+library(reticulate)
+library(tsfeatures)
+library(cluster)
+library(fs)
+
+
+# Plotting
+library(ggplot2)
+library(patchwork)
+library(cowplot)
+library(Polychrome)
+library(ComplexHeatmap)
+library(colorRamp2)
+library(pheatmap)
+library(scCustomize)
+library(viridis)
+library(Nebulosa)
+library(scales)
+
+library(ggforce)
+library(ggnewscale)
+library(ape)
+library(ggtree)
+library(ggtext)
+
+library(scatterpie)
+library(grid)
+library(gtable)
+library(ggrepel)
+
+
+# palalle
+library(doFuture)
+library(future)
+library(parallel)
+#library(foreach)
+#library(future.apply)
+library(doParallel)
+library(BiocParallel)
+
+
+set.seed(1234)
+options(future.globals.maxSize = 1e12)
+```
+
+## Read YAML
+
+Parmeterを記載したYAMLファイルの読み込み
+
+```{r ReadYAML, include=FALSE, echo =F}
+# 引数で指定できるように
+#yaml_file = "/Analysis/work/work_kuze/conf/Trajectory_Combined_Rezvani_2022_P3_Pando.yaml"
+yaml_file = "/Analysis/work/work_kuze/conf/Trajectory_Combined_Rezvani_2022_P5_Pando_260616.yaml"
+param <- yaml.load_file(yaml_file)
+
+
+#ディレクトリマップ
+dir_map <- param$directories
+
+# 各ファイルのフルパスを構築
+file_paths <- lapply(param$files, function(f) {
+  fs::path(dir_map[[f$dir]], f$name)
+})
+
+out_paths <- lapply(param$outfiles, function(f) {
+  fs::path(dir_map[[f$dir]], f$name)
+})
+
+# 名前付きリストに変換
+names(file_paths) <- names(param$files)
+names(out_paths) <- names(param$outfiles)
+
+param$files <- file_paths
+param$outfiles <- out_paths
+
+# outdirがなければ作成
+dir_path <- param$directories$outdir
+# ディレクトリの存在を確認し、存在しない場合は作成
+if (!dir.exists(dir_path)) {
+  dir.create(dir_path, recursive = TRUE)
+  message("ディレクトリを作成しました: ", dir_path)
+} else {
+  message("output ディレクトリは既に存在します: ", dir_path)
+}
+
+# outdirのsubdirも作成
+for( i in c(1:length(param$outdir_list))) {
+  param$outdir_list[i] <- paste0(param$directories$outdir,"/",param$outdir_list[i] )
+  d = param$outdir_list[i] %>% unlist
+  if (!dir.exists(d)) {
+    dir.create(d, recursive = TRUE)
+    message("ディレクトリを作成しました: ", d)
+  } 
+}
+
+if (!is.null(param$pca_ndim)){
+  param$pca_ndim <-  eval(parse(text = param$pca_ndim)) 
+  # param$monocle.useCluster <- eval(parse(text = param$monocle.useCluster)) 
+}
+param$outdir <- param$directories$outdir
+print(param)
+
+#set.seed(1234)
+#palette <- createPalette(20,　seedcolors=  c("#010101", "#ff0000"), M = 1000,prefix="NA")
+palettedt <- readRDS( param$colerPalet)
+names(palettedt) <- NULL
+# カラーパレットを表示します
+print(palettedt)
+# カラーパレットを視覚的に確認するためのプロット
+swatch(palettedt)
+
+```
+
+
+## Common Function
+``` {r function,include=TRUE ,height = 15,  width  =15}
+source(param$files$Function)
+standardt_obj_list <- c("standardt_obj_list","param","cluster_pallete", "palettedt")
+cluster_pallete <- palettedt[1:20]
+names(cluster_pallete) <- c(0:19 )
+bincoloer <- viridis(10)
+
+
+PredTime <- function(timebin_data , brdu_perid ){
+  bincount <-  timebin_data$sds.data %>% 
+    group_by(time.idx ) %>% 
+    summarise( count = n()) %>%
+    ungroup()
+
+  totalcell <-  bincount$count %>% sum()
+  Pred_cellPerDay <-  totalcell / brdu_perid
+  Pred_RealTime <-  bincount %>% 
+    mutate( PredDay = count / Pred_cellPerDay ) %>% 
+    mutate( cum_freq = cumsum(PredDay )) %>%
+    mutate(st = cum_freq- PredDay ,end = cum_freq)
+  
+  bincount_Cluster <- timebin_data$umap.sds %>% 
+    dplyr::select( "Cell" ,"time.idx","cluster" ) %>% 
+    group_by(time.idx,cluster ) %>% 
+    summarise( count = n()) %>%
+    ungroup() %>%
+    left_join(. , Pred_RealTime , by ="time.idx")
+  return( Pred_RealTime )
+  
+}
+
+```
+
+
+## Import data
+
+```{r Read_old data, include=TRUE ,height = 15,  width  =15}
+######################
+#Function
+#####################
+
+SetCellAnnotation  <- function(param,SeuratOBJ,Category_list, from_cname ="seurat_clusters"){
+  
+  from_val_list <- c()
+  to_val_list <- c()
+  for (i in c(1:length(Category_list)) ){
+    for (l in c(1:length(Category_list[[i]]))){
+      from_val_list <- c( from_val_list,Category_list[[i]][l] )
+      to_val_list <- c(to_val_list,names(Category_list)[i] )
+    }
+  }
+  category_change_list <- cbind( from =from_val_list , to =to_val_list )  %>% as.data.frame()
+  # from val not unique or uique chek
+  if( length(unique(category_change_list$from)) != nrow(category_change_list) ) {
+    print( "ERR!! from val not uniq !!")
+    return(0)
+  }
+  rownames(category_change_list) <- category_change_list$from
+  print(category_change_list)
+  
+  # make New metadate 
+  CellType_meta <- SeuratOBJ@meta.data %>% 
+    as.data.frame() %>% 
+    mutate( !!sym(from_cname) := as.character(!!sym(from_cname)) ) %>%
+    mutate( CellType = category_change_list[ !!sym(from_cname), "to" ] ) %>%
+    pull( CellType )
+  return(CellType_meta)
+}
+
+
+### Check CellCycle Score
+###
+### @input : praram ,SeuratOBJ,cluster_pallete
+### @return : None
+
+plotCellCycle <- function(param ,SeuratOBJ,cluster_pallete ){
+  p<-DimPlot( SeuratOBJ ,group.by = "seurat_clusters",cols = cluster_pallete )
+  output.file = paste0( param$outdir,"/umap_allCell.pdf" )
+  wggplot( p , file =output.file , height = 5,width = 5 )
+  
+  p <-VlnPlot( SeuratOBJ,features=c("S.Score", "G2M.Score" ),n = 2, group.by ="seurat_clusters" , pt.size = 0) +
+    theme(text = element_text(size = 20))
+  output.file = paste0( param$outdir,"/vinplot_S_G2Mscore_all.pdf" )
+  wggplot( p , file =output.file , height = 5,width = 10 )
+  
+  p<-DimPlot( SeuratOBJ ,group.by = "seurat_clusters",cols = cluster_pallete )
+  output.file = paste0( param$outdir,"/umap_allCell.pdf" )
+  wggplot( p , file =output.file , height = 5,width = 5 )
+  
+  p <-VlnPlot( SeuratOBJ,features=c("S.Score", "G2M.Score" ),n = 2, group.by ="seurat_clusters" , pt.size = 0) +
+    theme(text = element_text(size = 20))
+  output.file = paste0( param$outdir,"/vinplot_S_G2Mscore_all.pdf" )
+  wggplot( p , file =output.file , height = 5,width = 10 )
+  
+  return(0)
+}
+
+
+### Set CellCycle & Cluster Category
+###
+### @input : param,SeuratOBJ,CellCycle_th=0.25,cc.genes
+### @return : SeuratOBJ , 
+SetCellCycle <- function(param,SeuratOBJ,CellCycle_th=0.25,cc.genes){
+  #CellCycle_th <- 0.25
+  s.genes <- cc.genes$s.genes
+  s.genes <-  intersect(s.genes , rownames(SeuratOBJ))
+  Category_list <- param$ClusterCategory
+  
+  SeuratOBJ$rePhase <-SeuratOBJ@meta.data%>% 
+    as.data.frame() %>%
+    dplyr::select( "S.Score" ,"G2M.Score" ) %>%
+    apply(. , 1 , function(x,CellCycle_th){
+      if(x[1] < CellCycle_th & x[2] < CellCycle_th ){
+        return("G1")
+      } else if(x[1] >= CellCycle_th & x[2] < CellCycle_th ){
+        return("S")
+      } else if(x[1] < CellCycle_th & x[2] >= CellCycle_th ){
+        return("G2M")
+      } else if(x[1] >= CellCycle_th & x[2] >= CellCycle_th ){
+        if( x[1] > x[2]){
+          return("S")
+        } else{
+          return("G2M")
+        }
+        return("S")
+      }
+    },CellCycle_th=CellCycle_th)
+  SeuratOBJ$rePhase <- factor(SeuratOBJ$rePhase , levels = c("G1","S","G2M") )
+  p<-DimPlot( SeuratOBJ ,group.by = c("rePhase","Phase") ,pt.size = 0.2) 
+  output.file = paste0( param$outdir,"/umap_Compare_S_G2M.pdf" )
+  wggplot( p , file =output.file , height = 5,width = 10 )
+  
+  #output.file  <- paste0( param$outdir,"/ClusterCount_mat.txt" )
+  #CellCount <- SeuratOBJ@meta.data %>% 
+  #  select("rePhase" ,"seurat_clusters" , "CellType" )
+  #write.table( CellCount , file =output.file , quote = F ,sep ="\t" ,row.names = F )
+  
+  ## Functionにする
+  tableCellCyecle<- table(SeuratOBJ$rePhase, SeuratOBJ$CellType) %>% t
+  output.file <- paste0( param$outdir , "/Table_CellCyeclerePhase.txt")
+  write.table(tableCellCyecle , output.file ,quote = F ,col.names = NA,sep = "\t" )
+  
+  tableCellCyecle_Cluster<- table(SeuratOBJ$rePhase, SeuratOBJ$seurat_clusters)%>% 
+    as.data.frame()%>% 
+    rename( Phase="Var1",Cluster="Var2") %>% 
+    pivot_wider(.,names_from = "Phase",values_from = "Freq") %>% 
+    mutate( CellType = if_else(Cluster %in%  Category_list$SSCs , "SSCs" , 
+                               if_else(Cluster %in%  Category_list$Differentiation , "SPG(Differentiatio)" , "Other"  )
+    )) 
+  
+  output.file <- paste0( param$outdir , "/Table_CellCyecle_Cluster.txt")
+  write.table(tableCellCyecle_Cluster , output.file ,quote = F ,col.names = NA,sep = "\t" )
+  ## 
+  
+  return( SeuratOBJ)
+}
+
+
+
+### SeuratPlot
+###
+### @input : param , subsetOBJ , cluster_pallete ,cc.genes
+### @return :
+
+SueratSubsetandPlot <- function(param , subsetOBJ , cluster_pallete ,cc.genes){
+  p<-DimPlot( subsetOBJ ,group.by = "seurat_clusters",cols = cluster_pallete )
+  output.file = paste0( param$outdir,"/umap_SSCandDividedCell" )
+  wggplot( p , file =output.file , height = 6,width = 6 )
+  
+  p <- DimPlot( subsetOBJ ,group.by = "seurat_clusters",cols = cluster_pallete , split.by  = "seurat_clusters")
+  output.file = paste0( param$outdir,"/umpa_split_cluster_dividcell" )
+  wggplot( p , file =output.file , height = 5,width = 20 )
+  
+  p <- DimPlot( subsetOBJ ,group.by = "rePhase" ,pt.size = 0.2, split.by  = "rePhase") 
+  output.file = paste0( param$outdir,"/umap_split_manualPhase_dividcell" )
+  wggplot( p , file =output.file , height = 5,width = 15 )
+  
+  
+}
+
+#######################
+## Main process
+#######################
+SeuratOBJ <- readRDS(param$before_combined)
+
+DefaultAssay(SeuratOBJ) <- "RNA"
+SeuratOBJ <- NormalizeData(SeuratOBJ)
+
+commonGene <- SeuratOBJ[["RNA"]]@features@.Data %>% 
+  as.data.frame() %>% 
+  dplyr::filter( if_all(everything(), ~ .x == TRUE) ) %>% 
+  rownames %>%
+  as.character() %>%
+  unique()
+
+# assayごとにフィルタリング
+SeuratOBJ[["RNA"]] <- subset(SeuratOBJ[["RNA"]], features = intersect(commonGene, rownames(SeuratOBJ[["RNA"]])) )
+SeuratOBJ[["SCT"]] <- subset(SeuratOBJ[["SCT"]], features = intersect(commonGene, rownames(SeuratOBJ[["SCT"]])) )
+
+
+cluster_pallete <- palettedt
+names(cluster_pallete) <- c(0:(length(palettedt)-1))
+
+emb ="umap"
+Category_list <- param$Info$Combined$ClusterCategory
+
+
+## 後で修正
+param$outdir <- param$outdir_list$preprocess
+plotCellCycle(param ,SeuratOBJ,cluster_pallete )
+SeuratOBJ$CellType <-SetCellAnnotation(param,SeuratOBJ,Category_list, from_cname ="seurat_clusters")
+SeuratOBJ <- SetCellCycle(param , SeuratOBJ , CellCycle_th=0.25 , cc.genes)
+
+subset_Cluster <- Category_list$SSCs
+subsetOBJ <- subset(SeuratOBJ, seurat_clusters  %in% subset_Cluster )
+subsetOBJ <- subsetOBJ[,colnames(subsetOBJ)[subsetOBJ@reductions$umap@cell.embeddings[,1] < 2.6 &
+                         subsetOBJ@reductions$umap@cell.embeddings[,2] > -10 ] ]
+                         
+
+DimPlot( subsetOBJ ,group.by = "seurat_clusters",cols = cluster_pallete )
+#plot
+SueratSubsetandPlot(param , subsetOBJ , cluster_pallete ,cc.genes)
+
+standardt_obj_list <- c("standardt_obj_list","param","SeuratOBJ","cluster_pallete", "palettedt","Category_list","subsetOBJ","subset_Cluster","emb")
+                        # "LINGER_data_list","emb","numusePeak")
+
+```
+
+## Elipse fit Pseudotime
+
+```{r Elipse, include=TRUE ,height = 15,  width  =15}
+## Input  : param ,subsetOBJ  
+## Output : plot
+#extract start cell
+emb ="umap"
+total_day = param$Info$Prediction$total_day
+bin_day= param$Info$Prediction$bin_day
+
+if (! "umap" %in%  names(subsetOBJ@reductions)){
+  subsetOBJ@reductions[["umap"]] <-  subsetOBJ@reductions[[emb]] 
+  colnames(subsetOBJ@reductions[["umap"]]@cell.embeddings) <- c( "umap_1","umap_2")
+}
+
+start_cell_candidate <- list()
+
+
+# Pattern3
+umap_emb <- subsetOBJ@reductions[["umap"]]@cell.embeddings
+umap_emb  %>% 
+   as.data.frame( )%>% 
+   rownames_to_column( var ="cell") %>% 
+   mutate( rePhase = subsetOBJ@meta.data[cell , "rePhase" ] , 
+           cluster= subsetOBJ@meta.data[cell , "seurat_clusters" ] ,
+           S.Score = subsetOBJ@meta.data[cell ,"S.Score"],
+           G2M.Score = subsetOBJ@meta.data[cell ,"G2M.Score"] ,
+           comScore = S.Score - G2M.Score,
+           sumScore = S.Score + G2M.Score) %>% 
+   filter( cluster==8 & rePhase == "S"& S.Score < 0 & G2M.Score < 0 ) %>% 
+   arrange(sumScore) %>% head
+
+umap_emb  %>% 
+    as.data.frame( )%>% 
+    rownames_to_column( var ="cell") %>% 
+    mutate( rePhase = subsetOBJ@meta.data[cell , "rePhase" ] , 
+            cluster= subsetOBJ@meta.data[cell , "seurat_clusters" ] ,
+            S.Score = subsetOBJ@meta.data[cell ,"S.Score"],
+            G2M.Score = subsetOBJ@meta.data[cell ,"G2M.Score"] ,
+            comScore = S.Score - G2M.Score) %>% 
+    filter(cluster==8 & rePhase == "G1"& S.Score < 0 & G2M.Score < 0) %>%
+  pull(cell) -> testcall
+subsetOBJ$test <- "Other"
+subsetOBJ$test[testcall] <- "Select"
+DimPlot( subsetOBJ ,group.by = "test" )
+
+start_cell ="Human_241125_38yr_ACCTACCTCTCCTCAA-1"
+start_cell_candidate[["P3"]] <- start_cell
+
+
+
+#Pattern5 
+umap_emb <- subsetOBJ@reductions[["umap"]]@cell.embeddings
+umap_emb  %>% 
+   as.data.frame( )%>% 
+   rownames_to_column( var ="cell") %>% 
+   mutate( rePhase = subsetOBJ@meta.data[cell , "rePhase" ] , 
+           cluster= subsetOBJ@meta.data[cell , "seurat_clusters" ] ,
+           S.Score = subsetOBJ@meta.data[cell ,"S.Score"],
+           G2M.Score = subsetOBJ@meta.data[cell ,"G2M.Score"] ,
+           comScore = S.Score + G2M.Score) %>% 
+   filter( cluster==8 & rePhase == "S" ) %>% 
+   arrange( G2M.Score) %>% head
+
+
+start_cell = "Human_241125_38yr_GCCCGTTGTTGGTGAC-1"
+start_cell_candidate[["P5"]] <- start_cell
+
+
+start_cell <- start_cell_candidate[[param$PATTERN]] 
+
+param$outdir <- param$outdir_list$Pseudotime
+timeBin_data_org <- fitPseudoTime_theta(subsetOBJ, #fitPseudoTime
+                    reverset.time = F , 
+                    total_day = param$Info$Prediction$total_day ,
+                    bin_day= param$Info$Prediction$bin_day, # 当初は42binで予想
+                    start_cells = start_cell )
+output.file = paste0( param$outdir_list$Pseudotime, "/time_bin_data_org.rds" )
+saveRDS(timeBin_data_org , output.file )
+
+
+elipsePlot.data <- timeBin_data_org$umap.sds
+
+p1 <- elipsePlot.data%>% ggplot() + geom_point(aes( x=umap_1 , y=umap_2 , col =t ), size = 0.5) +
+    stat_myell(aes(x=umap_1 ,y= umap_2),colour = "red") +
+    theme_classic()
+p2 <- elipsePlot.data %>% ggplot() + geom_point(aes( x=umap_1  , y=umap_2 , col =cluster ), size = 0.5) +
+  scale_color_manual(values = cluster_pallete)+
+  theme_classic()
+p1 + p2
+output.file = paste0( param$outdir_list$Pseudotime,"/ElipsePlot_modified_divededCell_beforeExtrapolate" )
+wggplot( p1+p2 , output.file , height = 5,width = 10 )
+
+rm_list <- GetRmObjList (ls() , standardt_obj_list =  standardt_obj_list)
+rm( list = rm_list)
+gc()
+
+
+```
+
+## Extrapolate Dividing cell
+
+```{r fitting curve, include=TRUE ,height = 15,  width  =15}
+
+#外挿に関しては クラスタ8を抜き出す。
+timeBin_data_org <- readRDS(paste0( param$outdir_list$Pseudotime, "/time_bin_data_org.rds" ) )
+
+Extrapolate_bin <- function(timeBin_data , celllist ){
+  timeBin_data$sds.data =timeBin_data$sds.data %>% 
+    mutate( time.idx = if_else( Cell %in% celllist , 0 ,  time.idx +1),
+            t = if_else( Cell %in% celllist , 0 ,  t +1),
+    )
+  
+  timeBin_data$umap.sds = timeBin_data$umap.sds %>%
+    mutate( time.idx = if_else( Cell %in% celllist , 0 ,  time.idx +1),
+            t = if_else( Cell %in% celllist , 0 ,  t +1),
+    )
+  return(timeBin_data)
+}
+
+celllist <- subsetOBJ@meta.data %>% as.data.frame %>% filter(seurat_clusters == 8) %>% rownames()
+timeBin_data <- Extrapolate_bin(timeBin_data_org , celllist)
+
+output.file = paste0( param$outdir_list$Pseudotime, "/time_bin_data.rds" )
+saveRDS(timeBin_data , output.file )
+
+
+# x=umap_1 , y=umap_2 , col =t
+elipsePlot.data <- timeBin_data$umap.sds
+p1 <- elipsePlot.data%>% ggplot() + geom_point(aes( x=umap_1 , y=umap_2 , col =t ), size = 0.5) +
+    stat_myell(aes(x=umap_1 ,y= umap_2),colour = "red") +
+    theme_classic()
+p2 <- elipsePlot.data %>% ggplot() + geom_point(aes( x=umap_1  , y=umap_2 , col =cluster ), size = 0.5) +
+  scale_color_manual(values = cluster_pallete)+
+  theme_classic()
+p1 + p2
+output.file = paste0( param$outdir,"/ElipsePlot_modified_divededCell_AfterExtrapolate" )
+wggplot( p1+p2 , file =output.file , height = 5,width = 10 )
+
+rm_list <- GetRmObjList (ls() , standardt_obj_list =  standardt_obj_list)
+rm( list = rm_list)
+gc()
+
+```
+
+## Plot bin / cluster bar plot
+```{r}
+
+timeBin_data <-readRDS(  paste0(param$outdir_list$Pseudotime, "/time_bin_data.rds" ) )
+bin_anno_data <-table(timeBin_data$umap.sds$cluster, timeBin_data$umap.sds$time.idx) %>% 
+  as.matrix() %>% t
+rownames(bin_anno_data) <- 0:(param$Info$Prediction$total_day+1)
+
+long_bin_anno_data <-  bin_anno_data  %>% as.data.frame() %>% rename( bin="Var1",Cluster = "Var2") 
+
+# 文字サイズ設定
+base_size <- 15
+axis_title_size <- base_size
+axis_text_size <- base_size - 2
+
+p<-long_bin_anno_data %>% ggplot() + 
+  geom_bar( aes( x= bin , y =Freq , fill = Cluster,) ,  stat="identity" , position = "stack") + 
+  scale_fill_manual( values = cluster_pallete )+
+  theme_classic()+  
+  labs(title = "Frquency of Cell per bin",
+       x = "Pseudotime Bin",
+       y = "Count",
+       fill = "Clsuter")+
+  theme_minimal(base_size = base_size) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_text(size = axis_title_size),
+    axis.title.y = element_text(size = axis_title_size),
+    axis.text = element_text(size = 8),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.y.right = element_text(size = axis_title_size, color = "black")
+  )
+p
+output.file = paste0( param$outdir_list$Pseudotime ,"/PseudotimeBin_ClusterFreq" )
+wggplot(p,output.file,height =  3,width =  8 )
+
+
+rm_list <- GetRmObjList (ls() , standardt_obj_list =  standardt_obj_list)
+rm( list = rm_list)
+gc()
+
+```
+
+
+## fitting curve
+
+```{r fitting curve, include=TRUE ,height = 15,  width  =15}
+
+###  GAM fitting 
+###
+### @input : param,SeuratOBJ , Category_list
+### @return : SeuratOBJ 
+
+fitSmoothGAM  <- function(Y , genes , cell.ord , pseudotime ,num.cores =5 ,L1,total_day = 42 ,bin_day= 1,k =6){
+  library(mgcv)
+  expr_matrix <-Y[genes, cell.ord]
+  sc.tc.df.adj <- expr_matrix  %>% 
+    t %>% 
+    as.data.frame() %>% 
+    rownames_to_column( var ="Cell") %>% 
+    pivot_longer(-Cell,names_to = "GeneID",values_to = "log2.expr") %>% 
+    left_join( . , (L1$sds.data %>% dplyr::select( Cell , t ,rep)) , by = "Cell" ) %>%
+    #mutate( t= (t -min(t))/ ( max(t)-min(t))) %>%
+    transmute(y = log2.expr, tme = t, ind = rep, variable = GeneID)  
+  
+  spline.fits <- mclapply(1:length(genes), function(i){
+    # GAMで周期的スプラインをフィッティング
+    tmp <-  sc.tc.df.adj %>% dplyr::filter(variable == genes[i]) %>%
+      transmute(GeneID = variable, x = tme, y = y)
+    y <- tmp$y
+    t <- tmp$x
+    fit <- gam(y ~ s(t, bs = "cc",k = k))  
+    newdata <- data.frame(t = seq(0, total_day, by = bin_day))
+    rna.sp <- predict(fit, newdata = newdata)
+    mu <- data.frame(x = seq(0, total_day, by = bin_day), y = rna.sp) 
+    mu <- data.frame(GeneID = rep(tmp$GeneID[1], length(mu[,1])), x = mu[,1], y = mu[,2])
+    return(mu)
+  }, mc.cores = num.cores)
+  
+  return(spline.fits)
+}
+
+###  spline fitting 
+###
+### @input : param,SeuratOBJ , Category_list
+### @return : SeuratOBJ 
+
+fitSmoothSpline  <- function(Y , genes , cell.ord , pseudotime ,num.cores =5 ,L1,total_day = 42 ,bin_day= 1){
+  expr_matrix <-Y[genes, cell.ord]
+  sc.tc.df.adj <- expr_matrix  %>% 
+    t %>% 
+    as.data.frame() %>% 
+    rownames_to_column( var ="Cell") %>% 
+    pivot_longer(-Cell,names_to = "GeneID",values_to = "log2.expr") %>% 
+    left_join( . , (L1$sds.data %>% dplyr::select( Cell , t ,rep)) , by = "Cell" ) %>%
+    transmute(y = log2.expr, tme = t, ind = rep, variable = GeneID) 
+  
+  
+  spline.fits <- mclapply(1:length(genes), function(i){
+    tmp <- sc.tc.df.adj %>% dplyr::filter(variable == genes[i]) %>%
+      transmute(GeneID = variable, x = tme, y = y)
+    y <- tmp$y
+    t <- tmp$x
+    
+    w <- rep(1, length(y))
+    w[which(y == 0)] <- 1/2
+    rna.sp <- smooth.spline(t, y, lambda = 0.1, w = w)
+    
+    rna.sp <- predict(rna.sp, seq(0, total_day, by = bin_day)) 
+    mu <- data.frame(x = rna.sp$x, y = rna.sp$y) 
+    mu <- data.frame(GeneID = rep(tmp$GeneID[1], length(mu[,1])), x = mu[,1], y = mu[,2])
+    return(mu)
+  }, mc.cores = num.cores)
+  
+  return(spline.fits)
+}
+
+
+
+
+
+## Input  : param ,subsetOBJ  ,timeBin_data
+## Output : sc.spline.fits 
+
+total_day = param$Info$Prediction$total_day
+bin_day= param$Info$Prediction$bin_day
+
+param$outfiles$out_timebin <- paste0( param$outdir_list$Pseudotime, "/time_bin_data.rds" )
+
+result_fit <-DoExpgittingcurve_species( param, subsetOBJ, total_day = total_day+1 , #外挿分を+1する
+                              num.cores = 30 ,assay ="RNA" )
+
+output.file <- paste0( param$outdir_list$Pseudotime , "GAM_fittigGeneExp.rds")
+saveRDS(result_fit , output.file)
+
+rm_list <- GetRmObjList (ls() , standardt_obj_list =  standardt_obj_list)
+rm( list = rm_list)
+gc()
+
+```
+
+## Plot Summary
+```{r}
+
+#########################################################
+# Load Data
+#########################################################
+total_day = param$Info$Prediction$total_day
+bin_day= param$Info$Prediction$bin
+fitting_result <- readRDS(paste0( param$outdir_list$Pseudotime , "GAM_fittigGeneExp.rds"))
+combinedOBJ <- readRDS( param$before_combined)
+
+# coloer
+pal <- viridis(n = 10, option = "turbo")
+
+# load Human Data
+hum_sr.o.all.local <- readRDS( param$files$Human_SRscore )
+HumanSeuratOBJ <- readRDS( param$files$HumanSeuratOBJ )
+hum_sr.o.all.local.SR <-  hum_sr.o.all.local$SR
+names(hum_sr.o.all.local.SR ) <- rownames(HumanSeuratOBJ@meta.data )
+
+# load marmoset data
+MarmSeuratOBJ <- readRDS(param$files$MarmSeuratOBJ)
+mar_sr.o.all.local <- readRDS(param$files$Marm_SRscore)
+mar_sr.o.all.local.SR <-  mar_sr.o.all.local$SR
+names(mar_sr.o.all.local.SR ) <- rownames(MarmSeuratOBJ@meta.data )
+
+sr.score.file <- list( human = hum_sr.o.all.local.SR , marmoset =  mar_sr.o.all.local.SR )
+addATACobj <- list( human = HumanSeuratOBJ , marmoset = MarmSeuratOBJ)
+
+Category_list <- param$Info$Combined$ClusterCategory
+
+#spe_ATAC$combined_cluster <- combinedOBJ@meta.data[ colnames(spe_ATAC) ,"seurat_clusters"]
+cell_list <- c(colnames(fitting_result[["human"]]$seuratobj) , colnames(fitting_result[["marmoset"]]$seuratobj))
+combinedOBJ$combined_CellType <- SetCellAnnotation(param,
+                                                combinedOBJ,
+                                                Category_list, 
+                                                from_cname ="seurat_clusters")
+CellType_modefied_cell <-combinedOBJ@meta.data %>%
+  rownames_to_column( var = "Cell") %>% 
+  dplyr::filter( combined_CellType == "SSCs"  & !Cell %in%  cell_list ) %>% 
+  pull(Cell)
+combinedOBJ$combined_CellType[CellType_modefied_cell] <- "Differentiation"
+
+#---------------------
+# Cell Segragation
+#---------------------
+GS.hallmark <- readRDS(　param$files$GSdata )
+CHROMOSOME_SEGREGATION_gene  <- GS.hallmark["GOBP-CHROMOSOME-SEGREGATION"]
+# 328 gene
+CHROMOSOME_SEGREGATION_gene <- intersect( CHROMOSOME_SEGREGATION_gene$`GOBP-CHROMOSOME-SEGREGATION` ,
+                                          rownames(combinedOBJ@assays$RNA))
+
+#++++++++++++++++++++++++++++
+# update combined obj
+#++++++++++++++++++++++++++++
+
+commonGene <- combinedOBJ[["RNA"]]@features@.Data %>% 
+  as.data.frame() %>% 
+  dplyr::filter( if_all(everything(), ~ .x == TRUE) ) %>% 
+  rownames %>%
+  as.character() %>%
+  unique()
+
+DefaultAssay(combinedOBJ) <- "RNA"
+combinedOBJ[["RNA"]] <- subset(combinedOBJ[["RNA"]], features = intersect(commonGene, rownames(combinedOBJ[["RNA"]])) )
+combinedOBJ[["SCT"]] <- subset(combinedOBJ[["SCT"]], features = intersect(commonGene, rownames(combinedOBJ[["SCT"]])) )
+combinedOBJ <- JoinLayers(object = combinedOBJ ,assay = "RNA")
+
+#---------------------
+# add bin
+#---------------------
+combinedOBJ$bin <- NA
+combinedOBJ$bin[ fitting_result$marmoset$time.bin.data$sds.data$Cell ] <- 
+  fitting_result$marmoset$time.bin.data$sds.data$time.idx
+combinedOBJ$bin[ fitting_result$human$time.bin.data$sds.data$Cell ] <- 
+  fitting_result$human$time.bin.data$sds.data$time.idx
+
+#---------------------
+# add SRcore
+#---------------------
+combinedOBJ$SRcore <- NA
+combinedOBJ$SRcore[ names(hum_sr.o.all.local.SR ) ] <- hum_sr.o.all.local.SR
+combinedOBJ$SRcore[ names(mar_sr.o.all.local.SR ) ] <- mar_sr.o.all.local.SR
+
+#--------------------
+# add Riboscore & CHROMOSOME_SEGREGATION
+#--------------------
+#DefaultAssay(combinedOBJ) <- "RNA"
+# ⑤ HGNC記号ベースでリボソーム遺伝子を抽出
+
+ribo_hgnc <- grep("^RP[SL][0-9]{1,2}[A-Z]*$", commonGene, value = TRUE)
+combinedOBJ <- NormalizeData(object = combinedOBJ ,assay = "RNA")
+combinedOBJ <- AddModuleScore(
+  object = combinedOBJ, assay = "RNA",
+  features = list(ribo_hgnc),  #
+  name = "RiboActivity" 
+)
+
+combinedOBJ <- AddModuleScore(
+  object = combinedOBJ, assay = "RNA",
+  features = list(CHROMOSOME_SEGREGATION_gene),  #
+  name = "CHROMOSOME_SEGREGATION" 
+)
+
+#--------------------
+#　分裂前後で分ける
+#--------------------
+combinedOBJ$round_cluster <- combinedOBJ$seurat_clusters %>% as.character()
+combinedOBJ$round_cluster[combinedOBJ$seurat_clusters == 1 & combinedOBJ$bin > 20] <- "bfDivid_1"
+combinedOBJ$round_cluster[combinedOBJ$seurat_clusters == 1 & combinedOBJ$bin <= 20] <- "afDivid_1"
+combinedOBJ$round_cluster[combinedOBJ$seurat_clusters == 1 & combinedOBJ$bin <= 20] <- "afDivid_1"
+combinedOBJ$round_cluster[combinedOBJ$seurat_clusters%in% c(6,7)] <- "6_7"
+
+
+
+
+for( spe in c("human" ,"marmoset")){
+  #++++++++++++++++++++++++++++
+  #+ load data
+  #++++++++++++++++++++++++++++
+  
+  #spe ="marmoset"
+  timeBin_data <-fitting_result[[spe]]$time.bin.data
+  spe_subsetOBJ <- fitting_result[[spe]]$seuratobj
+  sc.spline.fits <- fitting_result[[spe]]$fitting.gam
+  
+  # add metadata 
+  sr.o.all.local <- sr.score.file[[spe]]
+  spe_subsetOBJ$SRscore <- sr.o.all.local[rownames(spe_subsetOBJ@meta.data)]
+  bin_data <- timeBin_data$sds.data$time.idx
+  names(bin_data) <- timeBin_data$sds.data$Cell
+  spe_subsetOBJ$bin <- bin_data[ rownames(spe_subsetOBJ@meta.data) ]
+  outdir <- param$outdir_list$STATS
+  
+  #++++++++++++++++++++++++++++
+  #+ Ribosomal score
+  #++++++++++++++++++++++++++++
+  # ⑤ HGNC記号ベースでリボソーム遺伝子を抽出
+  ribo_hgnc <- grep("^RP[SL][0-9]{1,2}[A-Z]*$", rownames(spe_subsetOBJ), value = TRUE)
+  
+  spe_subsetOBJ <- AddModuleScore(
+    object = spe_subsetOBJ,
+    features = list(ribo_hgnc),  #
+    name = "RiboActivity" 
+  )
+  #++++++++++++++++++++++++++++
+  #+ GO term score
+  #++++++++++++++++++++++++++++
+  spe_subsetOBJ <- AddModuleScore(
+    object = spe_subsetOBJ,
+    features = list(CHROMOSOME_SEGREGATION_gene),  #
+    name = "CHROMOSOME_SEGREGATION" 
+  )
+  
+  #++++++++++++++++++++++++++++
+  #+  Setting ATAC
+  #++++++++++++++++++++++++++++
+  # LINGER
+  spe_ATAC <- addATACobj[[spe]]
+  DefaultAssay(spe_ATAC) <- "ATAC"
+  spe_ATAC$combined_cluster <- combinedOBJ@meta.data[ colnames(spe_ATAC) ,"combined_CellType"]
+  
+  DefaultAssay(spe_ATAC) <- "ATAC"
+  annotations <- Annotation(spe_ATAC[["ATAC"]])
+  peak_name <- rownames(spe_ATAC[["ATAC"]])
+  use_peakflag <- !is.na(peak_name) &
+    str_detect(peak_name, "chr") &
+    !str_detect(peak_name, "chrUn") &
+    !str_detect(peak_name, "random")
+
+  peak_region <- peak_name[use_peakflag]
+  
+  tmp_atac <- resetAssayt(spe_ATAC, useAssay = "ATAC", feature = peak_region)
+  DefaultAssay(spe_ATAC) <- "RNA"
+  spe_ATAC[["ATAC"]] <- NULL
+  spe_ATAC[["ATAC"]] <- tmp_atac@assays$ATAC
+  DefaultAssay(spe_ATAC) <- "ATAC"
+  fitting_result[[spe]]$atac_obj <- spe_ATAC
+
+
+  #++++++++++++++++++++++++++++
+  #+ Plotting
+  #++++++++++++++++++++++++++++
+
+  fitting_result[[spe]]$seuratobj <- spe_subsetOBJ
+
+  # RiboActivity1
+  p1 <- FeaturePlot_scCustom(seurat_object = spe_subsetOBJ , 
+                             features ="RiboActivity1" ,colors_use  =pal)
+  p2 <- VlnPlot(spe_subsetOBJ,features = "RiboActivity1",
+                group.by = "seurat_clusters", cols =  cluster_pallete,
+                pt.size = 0,raster = FALSE) 
+  p3 <- VlnPlot(spe_subsetOBJ,features = "RiboActivity1",group.by = "bin", cols  =viridis(44),
+                pt.size = 0,raster = FALSE) + NoLegend()
+  (p1|p2)/p3
+  output.file <- paste0(outdir, "/RibActivityPlot_",spe,"_")
+  wggplot((p1|p2)/p3, output.file , height = 10 ,width = 10 )
+
+  # CHROMOSOME_SEGREGATION
+  p1 <- FeaturePlot_scCustom(seurat_object = spe_subsetOBJ ,  na_cutoff = 0,
+                             features ="CHROMOSOME_SEGREGATION1" ,colors_use  =pal)
+  p2 <- VlnPlot(spe_subsetOBJ,features = "CHROMOSOME_SEGREGATION1",
+                group.by = "seurat_clusters", cols =  cluster_pallete,
+                pt.size = 0,raster = FALSE) 
+  p3 <- VlnPlot(spe_subsetOBJ,features = "CHROMOSOME_SEGREGATION1",group.by = "bin", cols  =viridis(44),
+                pt.size = 0,raster = FALSE) + NoLegend()
+  (p1|p2)/p3
+  output.file <- paste0(outdir, "/CHROMOSOME_SEGREGATION_Plot_",spe,"_")
+  wggplot((p1|p2)/p3, output.file , height = 10 ,width = 10 )
+  
+  # S Score
+  p1 <- FeaturePlot_scCustom(seurat_object = spe_subsetOBJ ,  na_cutoff = -0.25,
+                             features ="S.Score" ,colors_use  =pal)
+  p2 <- VlnPlot(spe_subsetOBJ,features = "S.Score",
+                group.by = "seurat_clusters", cols =  cluster_pallete,
+                pt.size = 0,raster = FALSE) 
+  p3 <- VlnPlot(spe_subsetOBJ,features = "S.Score",group.by = "bin", cols  =viridis(44),
+                pt.size = 0,raster = FALSE) + NoLegend()
+  (p1|p2)/p3
+  output.file <- paste0(outdir, "/S_ScorePlot_",spe,"_")
+  wggplot((p1|p2)/p3, output.file , height = 10 ,width = 10 )
+  
+  # G2M Score
+  p1 <- FeaturePlot_scCustom(seurat_object = spe_subsetOBJ ,  na_cutoff = -0.25,
+                             features ="G2M.Score" ,colors_use  =pal)
+  p2 <- VlnPlot(spe_subsetOBJ,features = "G2M.Score",
+                group.by = "seurat_clusters", cols =  cluster_pallete,
+                pt.size = 0,raster = FALSE) 
+  p3 <- VlnPlot(spe_subsetOBJ,features = "G2M.Score",group.by = "bin", cols  =viridis(44),
+                pt.size = 0,raster = FALSE) + NoLegend()
+  (p1|p2)/p3
+  output.file <- paste0(outdir, "/G2M_ScoreyPlot_",spe,"_")
+  wggplot((p1|p2)/p3, output.file , height = 10 ,width = 10 )
+  
+  # SR score plot
+  p1 <- FeaturePlot_scCustom(seurat_object = spe_subsetOBJ , features ="SRscore" ,
+                             colors_use = pal,  na_cutoff = 0.84 ,pt.size = 0.1,max.cutoff = 0.89)
+  p2 <- VlnPlot(spe_subsetOBJ,features = "SRscore",group.by = "seurat_clusters",
+                cols =  cluster_pallete,pt.size = 0,raster = FALSE) 
+  p3 <- VlnPlot(spe_subsetOBJ,features = "SRscore",group.by = "bin", cols  =viridis(44),
+                pt.size = 0,raster = FALSE) + NoLegend()
+  (p1|p2)/p3
+  output.file <- paste0(outdir, "/SRscorePlot_",spe,"_")
+  wggplot((p1|p2)/p3, output.file , height = 10 ,width = 10 )
+  
+    
+  ## UMI plot
+  p1 <- FeaturePlot_scCustom(seurat_object = spe_subsetOBJ , features ="nCount_RNA" ,
+                             colors_use = pal,  max.cutoff = 30000 ,na_cutoff = 2000,pt.size = 0.3)
+  p2 <- VlnPlot(spe_subsetOBJ,features = "nCount_RNA",group.by = "seurat_clusters",
+                cols =  cluster_pallete,pt.size = 0,raster = FALSE) 
+  p3 <- VlnPlot(spe_subsetOBJ,features = "nCount_RNA",group.by = "bin", 
+                cols  =viridis(44),y.max=30000,
+                pt.size = 0,raster = FALSE) + NoLegend()
+  (p1|p2)/p3
+  output.file <- paste0(outdir, "/nCountRNAPlot_",spe,"_")
+  wggplot((p1|p2)/p3, output.file , height = 10 ,width = 10 )
+  
+  
+  ## nFeaturePlot
+  p1 <- FeaturePlot_scCustom(seurat_object = spe_subsetOBJ , features ="nFeature_RNA" ,
+                             colors_use = pal,  max.cutoff = 30000 ,na_cutoff = 2000,pt.size = 0.3)
+  p2 <- VlnPlot(spe_subsetOBJ,features = "nFeature_RNA",group.by = "seurat_clusters", 
+                cols =  cluster_pallete,pt.size = 0,raster = FALSE) 
+  p3 <- VlnPlot(spe_subsetOBJ,features = "nFeature_RNA",group.by = "bin", cols  =viridis(44),
+                pt.size = 0,raster = FALSE) + NoLegend()
+  (p1|p2)/p3
+  output.file <- paste0(outdir, "/nFeatureRNAPlot_",spe,"_")
+  wggplot((p1|p2)/p3, output.file , height = 10 ,width = 10 )
+  # Density
+  p1<-plot_density( spe_subsetOBJ, features = "RiboActivity1",size = 0.3) 
+  p2<-plot_density( spe_subsetOBJ, features = "SRscore",size = 0.3) 
+  p3<-plot_density( spe_subsetOBJ, features = "nCount_RNA",size = 0.3) 
+  p4<-plot_density( spe_subsetOBJ, features = "nFeature_RNA",size = 0.3) 
+  p<- (p1+p2) / (p3+p4)
+  outfiles <- paste0( outdir ,"UMAPDensity_Plot_",spe)
+  wggplot( p ,outfiles,height =10,width =10 )
+
+}
+
+output.file <- paste0( param$outdir_list$Pseudotime , "GAM_fittigGeneExp_addInfo.rds")
+saveRDS(fitting_result , output.file ,compress = FALSE)
+
+#combinedOBJ
+output.file <- paste0( param$directories$outdir , "/Updateded_CombinedOBJ.rds")
+saveRDS(combinedOBJ , output.file)
+
+rm_list <- GetRmObjList (ls() , standardt_obj_list =  standardt_obj_list)
+rm( list = rm_list)
+gc()
+
+
+```
+
+
+## pando prediction 
+
+```{r}
+#########################################################
+# Function
+#########################################################
+
+
+# 疎行列 counts から「各ピークで >0 のセル数」を高速に計算
+# counts: dgCMatrix (features x cells)
+open_cell_counts <- function(counts) {
+  if (!inherits(counts, "dgCMatrix")) counts <- as(counts, "dgCMatrix")
+  # 0/1化して rowSums（@x を直接いじるのでコピーしてから）
+  bin <- counts
+  bin@x <- rep.int(1, length(bin@x))
+  Matrix::rowSums(bin)
+}
+
+# RNA counts と cell名から、human/marmoset の発現率をベクトル化で計算
+calc_exprate <- function(rna_counts, human_pattern = "Human") {
+  # rna_counts: genes x cells (dgCMatrix 推奨)
+  if (!inherits(rna_counts, "dgCMatrix")) rna_counts <- as(rna_counts, "dgCMatrix")
+  cell_is_human <- grepl(human_pattern, colnames(rna_counts), fixed = TRUE)
+  nh <- sum(cell_is_human)
+  nm <- sum(!cell_is_human)
+
+  # >0 判定の疎行列を0/1化して rowSums
+  bin <- rna_counts
+  bin@x <- rep.int(1, length(bin@x))
+
+  human_open <- Matrix::rowSums(bin[, cell_is_human, drop = FALSE])
+  marm_open  <- Matrix::rowSums(bin[, !cell_is_human, drop = FALSE])
+
+  data.frame(
+    human = human_open / nh,
+    marmoset = marm_open / nm,
+    row.names = rownames(rna_counts)
+  )
+}
+
+# species 1つ分の Pando GRN を実行
+run_pando_for_species <- function(
+  spe,
+  atac_obj,
+  selectedGene,
+  motifs,
+  motif2tf,
+  genomeName,
+  outdir,
+  ncores = 8,
+  distance_thresh = 10000,
+  open_rate_thresh = 0.01,
+  peak_to_gene_method = "GREAT",
+  p_thresh = 0.1,
+  nvar_thresh = 2,
+  min_genes_per_module = 3,
+  rsq_thresh = 0.05
+) {
+  message("---- Running Pando for: ", spe, " ----")
+
+  DefaultAssay(atac_obj) <- "ATAC"
+
+  annotations <- Annotation(atac_obj[["ATAC"]])
+  peak_region <- rownames(atac_obj[["ATAC"]])
+
+  transcript_annotation <- annotations[mcols(annotations)$type == "transcript", ]
+  gr_resized <- resize_by_strand_with_region_string(transcript_annotation,up = 0 ,down = 0)
+
+  closest_genes <- ClosestFeature(
+    atac_obj,
+    regions = peak_region,
+    annotation = gr_resized
+  )
+
+  counts <- atac_obj@assays$ATAC$counts
+  open_cell <- open_cell_counts(counts)
+  total_cell <- ncol(atac_obj)
+
+  filtered_peak <- closest_genes %>%
+    mutate(
+      open_cell = open_cell[query_region],
+      open_rate = open_cell / total_cell
+    ) %>%
+    filter(distance < distance_thresh, open_rate > open_rate_thresh) %>%
+    pull(query_region) %>%
+    unique()
+
+  muo_data <- atac_obj
+  muo_data <- initiate_grn(
+    muo_data,
+    rna_assay  = "RNA",
+    peak_assay = "ATAC",
+    regions    = StringToGRanges(filtered_peak)
+  )
+
+  muo_data <- find_motifs(
+    muo_data,
+    pfm       = motifs,
+    motif_tfs = motif2tf,
+    genome    = genomeName
+  )
+
+  # 並列は外で registerDoParallel しておけばOKだが、
+  # ここでも ncores に合わせたい場合は上書きできる
+  registerDoParallel(ncores)
+
+  muo_data <- infer_grn(
+    muo_data,
+    peak_to_gene_method = peak_to_gene_method,
+    genes = selectedGene,
+    parallel = TRUE
+  )
+
+  muo_data <- find_modules(
+    muo_data,
+    p_thresh = p_thresh,
+    nvar_thresh = nvar_thresh,
+    min_genes_per_module = min_genes_per_module,
+    rsq_thresh = rsq_thresh
+  )
+
+  modules <- NetworkModules(muo_data)
+
+  # 出力
+  coef_tfts <- coef(muo_data)
+  write.table(
+    coef_tfts,
+    file = file.path(outdir, sprintf("%s_pando_modelcoef.txt", spe)),
+    quote = FALSE, sep = "\t",
+    row.names = TRUE, col.names = NA
+  )
+  write.table(
+    modules@meta,
+    file = file.path(outdir, sprintf("%s_pando_module.txt", spe)),
+    quote = FALSE, sep = "\t",
+    row.names = TRUE, col.names = NA
+  )
+
+  # QC plot
+  p1 <- plot_gof(muo_data, point_size = 3)
+  wggplot(p1, file.path(outdir, sprintf("pando_qc_%s_", spe)), height = 10, width = 10)
+
+  p2 <- plot_module_metrics(muo_data)
+  wggplot(p2, file.path(outdir, sprintf("pando_qc2_%s_", spe)), height = 3, width = 10)
+
+  muo_data <- get_network_graph(muo_data)
+  p3 <- plot_network_graph(muo_data)
+  wggplot(p3, file.path(outdir, sprintf("pando_network_%s_", spe)), height = 15, width = 15)
+
+  saveRDS(filtered_peak, file.path(outdir, sprintf("%s_filtered_peak.rds", spe)))
+  saveRDS(muo_data,     file.path(outdir, sprintf("%s_seuratLINKED_afPando.rds", spe)))
+
+  invisible(list(muo_data = muo_data, filtered_peak = filtered_peak, modules = modules))
+}
+
+#########################################################
+# Main
+#########################################################
+
+# Load fitting result
+fitting_result <- readRDS(paste0(param$outdir_list$Pseudotime,
+                                 "GAM_fittigGeneExp_addInfo.rds"))
+
+# outdir
+param$outdir <- paste0(param$directories$outdir, "/Pando/")
+outdir <- make_outdir(param$outdir)
+
+# Load combined obj once
+combinedOBJ <- readRDS(paste0(param$directories$outdir, "/Updateded_CombinedOBJ.rds"))
+
+# selectedGene（高速化版）
+rna_counts <- GetAssayData(combinedOBJ, assay = "RNA", layer = "counts")
+expRate_df <- calc_exprate(rna_counts, human_pattern = "Human")
+selectedGene <- expRate_df %>%
+  filter(human >= 0.1 | marmoset >= 0.1) %>%
+  rownames()
+
+# motifs
+data("motifs")
+data("motif2tf")
+
+# 安全に書き出し
+capture.output(motifs@listData, file = file.path(outdir, "motif_inf.txt"))
+write.table(motif2tf,
+            file = file.path(outdir, "motif2tf.txt"),
+            quote = FALSE, sep = "\t",
+            row.names = TRUE, col.names = NA)
+
+# 先に並列設定（必要なら species ごとに上書き）
+registerDoParallel(12)
+
+#########################################################
+# Run: marmoset / human
+#########################################################
+
+# marmoset
+res_marmoset <- run_pando_for_species(
+  spe = "marmoset",
+  atac_obj = fitting_result[["marmoset"]]$atac_obj,
+  selectedGene = selectedGene,
+  motifs = motifs,
+  motif2tf = motif2tf,
+  genomeName = "BSgenome.Cjacchus.UCSC.calJac4",
+  outdir = outdir,
+  ncores = 12
+)
+
+# human
+res_human <- run_pando_for_species(
+  spe = "human",
+  atac_obj = fitting_result[["human"]]$atac_obj,
+  selectedGene = selectedGene,
+  motifs = motifs,
+  motif2tf = motif2tf,
+  genomeName = "BSgenome.Hsapiens.UCSC.hg38",
+  outdir = outdir,
+  ncores = 12
+)
+
+stopImplicitCluster()
+# cleanup（必要なら）
+rm(list = setdiff(ls(), c("param", "fitting_result", "res_marmoset", "res_human")))
+gc()
+
+```
+
+## pando plotting
+```{r}
+
+#suppressPackageStartupMessages({
+#  library(Seurat)
+#  library(dplyr)
+#  library(Matrix)
+#  library(tibble)
+#  library(chromVAR)
+#  library(SummarizedExperiment)
+#  library(motifmatchr)
+#  library(viridisLite)
+#  library(igraph)
+#})
+
+#########################################################
+# Params / Load
+#########################################################
+
+total_day <- param$Info$Prediction$total_day + 1
+bin_day   <- param$Info$Prediction$bin
+
+fitting_result <- readRDS(paste0(param$outdir_list$Pseudotime,
+                                 "GAM_fittigGeneExp_addInfo.rds"))
+
+param$outdir <- paste0(param$directories$outdir, "/Pando/")
+outdir <- make_outdir(param$outdir)
+
+# Load combined obj once（重複削除）
+combinedOBJ <- readRDS(paste0(param$directories$outdir, "/Updateded_CombinedOBJ.rds"))
+common_gene <- rownames(combinedOBJ)
+
+#########################################################
+# selectedGene（apply→疎行列ベクトル化）
+#########################################################
+
+rna_counts <- GetAssayData(combinedOBJ, assay = "RNA", layer = "counts")
+expRate_df <- calc_exprate(rna_counts, human_pattern = "Human")
+
+selectedGene <- expRate_df %>%
+  filter(human >= 0.1 | marmoset >= 0.1) %>%
+  rownames()
+
+gc()
+
+#########################################################
+# Prep Data: binaverage_score（speciesで共通化）
+#########################################################
+
+prep_binaverage_score_one <- function(spe, fitting_result, use_scaled_rna = FALSE,
+                                      n_rna_bins = 45) {
+  spe_atacOBJ   <- fitting_result[[spe]]$atac_obj
+  # timeBin_data <- fitting_result[[spe]]$time.bin.data  # ここでは未使用なら読みっぱなし回避
+  # spe_subsetOBJ<- fitting_result[[spe]]$seuratobj       # 同上
+
+  # bin / clusterラベル
+  spe_atacOBJ$bin <- spe_atacOBJ$time.idx
+  spe_atacOBJ$bin_Cluster <- spe_atacOBJ$CellType
+  spe_atacOBJ$bin_Cluster[!is.na(spe_atacOBJ$bin)] <- as.character(spe_atacOBJ$bin[!is.na(spe_atacOBJ$bin)])
+
+  # --- ATAC average (layer="data") ---
+  DefaultAssay(spe_atacOBJ) <- "ATAC"
+  sc.mat.atac.ave <- AverageExpression(
+    spe_atacOBJ, assays = "ATAC",
+    group.by = "bin_Cluster", layer = "data"
+  )$ATAC
+  colnames(sc.mat.atac.ave) <- gsub("^g", "", colnames(sc.mat.atac.ave))
+
+  # --- RNA average ---
+  DefaultAssay(spe_atacOBJ) <- "RNA"
+
+  if (use_scaled_rna) {
+    feats <- rownames(spe_atacOBJ)
+    spe_atacOBJ <- ScaleData(spe_atacOBJ, features = feats, verbose = FALSE)
+
+    sc.mat.rna.ave <- AverageExpression(
+      spe_atacOBJ, assays = "RNA",
+      group.by = "bin_Cluster", layer = "scale.data"
+    )$RNA
+  } else {
+    sc.mat.rna.ave <- AverageExpression(
+      spe_atacOBJ, assays = "RNA",
+      group.by = "bin_Cluster", layer = "data"
+    )$RNA
+  }
+
+  colnames(sc.mat.rna.ave) <- gsub("^g", "", colnames(sc.mat.rna.ave))
+
+  list(
+    atac = sc.mat.atac.ave,
+    rna  = sc.mat.rna.ave,
+    nearGene = fitting_result[[spe]]$atac_closet_gene
+  )
+}
+
+binaverage_score <- setNames(
+  lapply(c("human", "marmoset"), prep_binaverage_score_one,
+         fitting_result = fitting_result,
+         use_scaled_rna = FALSE,   # ←Z-score平均が必要ならTRUEへ
+         n_rna_bins = 44),
+  c("human", "marmoset")
+)
+
+#########################################################
+# Cluster average (combined)
+#########################################################
+
+ClusterAverageEXP <- AverageExpression(
+  combinedOBJ,
+  group.by = c("species", "seurat_clusters"),
+  assays = "RNA",
+  layer = "data"
+)$RNA %>% as.data.frame()
+
+#########################################################
+# Load motif data (once)
+#########################################################
+data("motifs")
+data("motif2tf")
+
+genomeName <- list(
+  marmoset = "BSgenome.Cjacchus.UCSC.calJac4",
+  human    = "BSgenome.Hsapiens.UCSC.hg38"
+)
+
+#########################################################
+# chromVAR + module postprocessing（speciesで共通化）
+#########################################################
+
+# TF_binrank：applyをやめて max.col で高速化
+make_TF_binrank <- function(rna_ave_mat, tf_list, colnames_list = NULL ) {
+  if( is.null(colnames_list)){
+    print(" colnames_list nullです" )
+    return(NULL)
+  }
+  if( ! all(colnames_list %in% colnames(rna_ave_mat)  ) ){
+    erro_col <- colnames_list[! colnames_list %in% colnames(rna_ave_mat)  ]
+    print(" colnames_list が matに含まれていないカラムを持っています。" )
+    print(erro_col  )
+    return(NULL)
+    
+  }
+  mat <- as.matrix(rna_ave_mat[, colnames_list, drop = FALSE])
+  idx <- max.col(mat, ties.method = "first")
+  bin_category <- colnames(mat)[idx]
+
+  out <- data.frame(
+    Gene = rownames(mat),
+    bin_category = bin_category,
+    stringsAsFactors = FALSE
+  )
+  out$bin <- suppressWarnings(as.numeric(out$bin_category))
+  rownames(out) <- out$Gene
+  return(out)
+  # TFだけに絞るならここで
+  #out[out$Gene %in% tf_list, , drop = FALSE]
+}
+
+run_chromvar_and_export <- function(muo_data, filtered_peak, motifs, motif2tf,
+                                   genome_pkg, outdir, spe) {
+  # grn regions と raw peak の対応表（grn_range バグ修正）
+  gr <- muo_data@grn@regions@ranges
+  grn_region <- paste0(as.character(seqnames(gr)), ":", start(gr), "-", end(gr))
+
+  pando_region2Peak <- data.frame(
+    grn_data = grn_region,
+    raw = rownames(muo_data@data)[muo_data@grn@regions@peaks],
+    stringsAsFactors = FALSE
+  )
+
+  # filtered_peak を Pando内のrawピークに合わせて絞る
+  keep <- unique(pando_region2Peak$raw)
+  filtered_peak <- filtered_peak[filtered_peak %in% keep]
+
+  DefaultAssay(muo_data@data) <- "ATAC"
+  atac_counts <- GetAssayData(muo_data@data, assay = "ATAC", layer = "counts")[filtered_peak, , drop = FALSE]
+
+  rowRanges <- StringToGRanges(filtered_peak)
+  chromvarobj <- SummarizedExperiment(
+    assays = list(counts = atac_counts),
+    rowRanges = rowRanges,
+    colData = muo_data@data@meta.data
+  )
+
+  chromvarobj <- addGCBias(chromvarobj, genome = genome_pkg)
+  motif_ix <- matchMotifs(motifs, chromvarobj, genome = genome_pkg)
+
+  chromvarobj_dev <- computeDeviations(object = chromvarobj, annotations = motif_ix)
+
+  dev_mat <- deviations(chromvarobj_dev)
+  dev_df <- as.data.frame(as.matrix(dev_mat)) %>%
+    rownames_to_column("motif") %>%
+    left_join(motif2tf %>% select(motif, tf), by = "motif") %>%
+    relocate(motif, tf)
+
+  write.table(
+    dev_df,
+    file = file.path(outdir, sprintf("deviations_matrix_%s_pando_motif.txt", spe)),
+    quote = FALSE, sep = "\t",
+    row.names = FALSE, col.names = TRUE
+  )
+
+  saveRDS(motif_ix, file.path(outdir, sprintf("MotifPeak_match_%s.rds", spe)))
+
+  invisible(list(filtered_peak = filtered_peak, motif_ix = motif_ix, dev_df = dev_df))
+}
+
+postprocess_one_species <- function(spe, outdir, motifs, motif2tf, genomeName,
+                                    binaverage_score, common_gene, ClusterAverageEXP,chromvar=F) {
+
+  muo_data <- readRDS(file.path(outdir, sprintf("%s_seuratLINKED_afPando.rds", spe)))
+  modules <- NetworkModules(muo_data)
+
+  TF_list <- unique(motif2tf$tf)
+  TF_list <- intersect(common_gene, TF_list)
+
+  # TF bin rank（高速）
+  colnames_list =c(0:43,"Differentiation") %>% as.character()
+  TF_binrank <- make_TF_binrank(binaverage_score[[spe]]$rna, TF_list, colnames_list = colnames_list )
+
+  # coef + fit 結合（順序の明示）
+  coed_model_tfts <- muo_data@grn@networks$glm_network@coefs %>%
+    left_join(muo_data@grn@networks$glm_network@fit, by = "target")
+
+  module_data <- modules@meta %>%
+    left_join(TF_binrank, by = c("tf" = "Gene")) %>%
+    left_join(
+      binaverage_score[[spe]]$rna %>% as.data.frame() %>% rownames_to_column("gene"),
+      by = c("tf" = "gene")
+    )
+
+  # ---- outputs ----
+  write.table(module_data,
+              file = file.path(outdir, sprintf("%s_pando_module_with_Exp.txt", spe)),
+              quote = FALSE, sep = "\t", row.names = TRUE, col.names = NA)
+
+  write.table(coed_model_tfts,
+              file = file.path(outdir, sprintf("%s_pando_modelcoef.txt", spe)),
+              quote = FALSE, sep = "\t", row.names = TRUE, col.names = NA)
+
+  write.table(modules@meta,
+              file = file.path(outdir, sprintf("%s_pando_module.txt", spe)),
+              quote = FALSE, sep = "\t", row.names = TRUE, col.names = NA)
+
+  # QC plot（ファイル名整理）
+  p <- plot_gof(muo_data, point_size = 3)
+  wggplot(p, file.path(outdir, sprintf("pando_qc_%s_", spe)), height = 10, width = 10)
+
+  p <- plot_module_metrics(muo_data)
+  wggplot(p, file.path(outdir, sprintf("pando_qc2_%s_", spe)), height = 3, width = 10)
+
+  # UMAP graph plot
+  muo_data <- get_network_graph(muo_data, graph_name = "umap_graph")
+  umap_graph <- NetworkGraph(muo_data, graph = "umap_graph")
+
+  plot_gene <- TF_binrank[intersect(V(umap_graph)$name, TF_binrank$Gene), , drop = FALSE]
+  node_cat <- setNames(plot_gene$bin_category, plot_gene$Gene)
+
+  pal <- viridisLite::viridis(44)
+  pal <- c(pal, "red", "gray")
+  names(pal) <- c(0:43, "Differentiation", "Other")
+
+  p1 <- plot_grn_custom(
+    muo_data,
+    node_color  = node_cat,
+    palette     = pal,
+    color_label = "bin category",
+    title       = paste0("GRN UMAP | bin (", spe, ")"),
+    size_range  = c(1, 8),
+    show_labels = TF_list
+  )
+  wggplot(p1, file.path(outdir, sprintf("pando_GRN_Umap_%s_", spe)), height = 10, width = 15)
+
+  # Full graph
+  muo_data <- get_network_graph(muo_data)
+  p <- plot_network_graph(muo_data)
+  wggplot(p, file.path(outdir, sprintf("pando_network_%s_", spe)), height = 15, width = 15)
+
+  # ranking
+  tf_rank <- modules@meta %>%
+    as.data.frame() %>%
+    group_by(tf) %>%
+    summarise(num_of_target = dplyr::n(), .groups = "drop") %>%
+    arrange(desc(num_of_target)) %>%
+    left_join(ClusterAverageEXP %>% rownames_to_column("Gene"),
+              by = c("tf" = "Gene"))
+
+  write.table(tf_rank,
+              file = file.path(outdir, sprintf("%s_pando_TF_ranking.txt", spe)),
+              quote = FALSE, sep = "\t", row.names = TRUE, col.names = NA)
+
+  gene_rank <- coed_model_tfts %>%
+    as.data.frame() %>%
+    group_by(target) %>%
+    summarise(num_of_target = dplyr::n(), .groups = "drop") %>%
+    arrange(desc(num_of_target))
+
+  write.table(gene_rank,
+              file = file.path(outdir, sprintf("%s_pando_Gene_ranking.txt", spe)),
+              quote = FALSE, sep = "\t", row.names = TRUE, col.names = NA)
+
+  # 保存（ファイル名のドット修正）
+  muo_data <- get_network_graph(muo_data, graph_name = "full_graph", umap_method = "none")
+  saveRDS(muo_data, file.path(outdir, sprintf("plottedPandoOBJ_%s.rds", spe)))
+
+  invisible(list(muo_data = muo_data, modules = modules, TF_binrank = TF_binrank))
+}
+
+# speciesをまとめて実行
+res_list <- setNames(
+  lapply(c("human", "marmoset"), postprocess_one_species,
+         outdir = outdir,
+         motifs = motifs,
+         motif2tf = motif2tf,
+         genomeName = genomeName,
+         binaverage_score = binaverage_score,
+         common_gene = common_gene,
+         ClusterAverageEXP = ClusterAverageEXP),
+  c("human", "marmoset")
+)
+
+# cleanup（必要なら）
+rm(list = setdiff(ls(), c("param", "fitting_result", "res_marmoset", "res_human")))
+gc()
+```
+
+## Bin Correlation
+
+```{r  }
+
+
+### MakeCorrelationPlot
+###
+### @input :     Compare_obj_list ,outdir ,common_gene , category 
+### @return : None
+
+MakeCorrelationPlot <- function( Compare_obj_list ,outdir ,common_gene , category = "bin" ,assayD="RNA", ht_title=""){
+  if (  !category %in% colnames(Compare_obj_list[[1]]@meta.data) ) {
+    print( paste0( "category: ", category , " not inmetadate. plese retry..") )
+    return(0)
+  }
+  ## main comapre 2 species
+  # resset assay
+  Compare_obj_list <- lapply(Compare_obj_list , function(x){ resetAssayt(x, assayD ,common_gene) } )
+  spe_name = names(Compare_obj_list)
+  
+  ## 平均発現量での相関を評価
+  mean_bin_exp_spe1 = AverageExpression( Compare_obj_list[[1]] , assays = assayD ,group.by =  category )[[assayD]]
+  mean_bin_exp_spe2 = AverageExpression( Compare_obj_list[[2]] , assays = assayD ,group.by =  category )[[assayD]]
+  
+  colnames(mean_bin_exp_spe1) <- paste0( gsub("[0-9]$","",spe_name[1]) , "_" , gsub("^g","",colnames(mean_bin_exp_spe1)) )
+  colnames(mean_bin_exp_spe2) <- paste0( gsub("[0-9]$","",spe_name[2])  , "_" , gsub("^g","",colnames(mean_bin_exp_spe2)) )
+  bin_cor_matrix <- cor(mean_bin_exp_spe2[common_gene,] %>% as.matrix() , mean_bin_exp_spe1[common_gene,] %>% as.matrix() )
+  
+  # barplot of bin count 
+  if ( category == "bin" | category == "mod_bin") {
+    
+    if (category == "bin" ){
+      bin_count_spe1 <-table(Compare_obj_list[[1]]@meta.data$RNA_cluster, 
+                             Compare_obj_list[[1]]@meta.data$bin) %>% as.matrix() %>% t
+      
+      bin_count_spe2 <-table(Compare_obj_list[[2]]@meta.data$RNA_cluster, 
+                             Compare_obj_list[[2]]@meta.data$bin) %>% as.matrix() %>% t
+      rownames(bin_count_spe1) <- 0:43    
+      rownames(bin_count_spe2) <- 0:43
+    } else{
+      
+      bin_count_spe1 <-table(Compare_obj_list[[1]]@meta.data$RNA_cluster, 
+                             Compare_obj_list[[1]]@meta.data$mod_bin) %>% as.matrix() %>% t
+      
+      bin_count_spe2 <-table(Compare_obj_list[[2]]@meta.data$RNA_cluster, 
+                             Compare_obj_list[[2]]@meta.data$mod_bin) %>% as.matrix() %>% t
+      print( bin_count_spe1)
+      rownames(bin_count_spe1)[1:44] <- 0:43
+      rownames(bin_count_spe2)[1:44]<- 0:43
+    }
+    #+++ Heatamap ++++++
+    ## col annotaion = x軸 spe2
+    #HeatmapAnnotaion 
+    annotation_spe1 <-  setNames( 
+      list( anno_barplot(bin_count_spe1,bar_width = 1,
+                         gp = gpar(fill = cluster_pallete[colnames(bin_count_spe1)] ),
+                         border = TRUE,axis = TRUE,
+                         height = unit(4, "cm"))  ) 
+      , spe_name[1] )  
+    annotation_spe2 <- setNames( 
+      list( anno_barplot(bin_count_spe2,bar_width = 1,
+                         gp = gpar(fill = cluster_pallete[colnames(bin_count_spe2)] ),
+                         border = TRUE,axis = TRUE,which = "row",
+                         width = unit(4, "cm"))  ) 
+      , spe_name[2] )  
+  } else {
+    bin_count_spe1 <- table(Compare_obj_list[[1]]@meta.data[, category])  %>% as.matrix
+    #rownames(bin_count_spe1) <- 0:43
+    bin_count_spe2 <-table(Compare_obj_list[[2]]@meta.data[, category])  %>% as.matrix
+    #rownames(bin_count_spe2) <- 0:43
+    
+    annotation_spe1 <-  setNames( 
+      list( anno_barplot(bin_count_spe1,bar_width = 1,
+                         gp = gpar(fill = cluster_pallete[rownames(bin_count_spe1)] ),
+                         border = TRUE,axis = TRUE,
+                         height = unit(4, "cm"))  ) 
+      , spe_name[1] )  
+    annotation_spe2 <- setNames( 
+      list( anno_barplot(bin_count_spe2,bar_width = 1,
+                         gp = gpar(fill = cluster_pallete[rownames(bin_count_spe2)] ),
+                         border = TRUE,axis = TRUE,which = "row",
+                         width = unit(4, "cm"))  ) 
+      , spe_name[2] )  
+  }
+  
+  ha <- do.call(HeatmapAnnotation, annotation_spe1)
+  row_ha <- do.call(rowAnnotation ,annotation_spe2 )
+  
+  col_viridis = viridis(n = 44, option = "turbo") 
+  
+  #print(bin_cor_matrix )
+  ht=Heatmap(bin_cor_matrix,
+             name = "Correlation", 
+             #col = col_viridis ,
+             column_title = ht_title,
+             top_annotation = ha, 
+             left_annotation = row_ha,
+             show_column_names = T,
+             show_row_names =  T,
+             cluster_columns = FALSE,
+             cluster_rows = FALSE , width = unit(18, "cm"),height = unit(18, "cm"))
+  #+++ Heatamap ++++++
+  
+  output.file = paste0( outdir,"bincorrelationHeatmap.pdf" )
+  pdf( file = output.file , height = 14 ,width = 14)
+  
+  draw(ht)
+  dev.off()
+  
+  output.file = paste0( outdir,"bincorrelationHeatmap.png" )
+  png( file = output.file , height = 1000 ,width = 1000)
+  draw(ht)
+  dev.off()
+  return( list( cormat = bin_cor_matrix , mean1 = mean_bin_exp_spe1 , mean2 = mean_bin_exp_spe2  ) )
+}
+
+
+
+#########################################################
+# LOAD_DATA
+#########################################################
+total_day = param$Info$Prediction$total_day
+bin_day= param$Info$Prediction$bin
+bin_range = 0:(total_day+1)
+
+param$outdir <- paste0(param$directories$outdir,"/Cor/")
+if (!dir.exists(param$outdir)) {
+  dir.create(param$outdir, recursive = TRUE)
+  message("ディレクトリを作成しました: ", param$outdir)
+} else {
+  message("output ディレクトリは既に存在します: ", param$outdir)
+}
+
+
+fitting_result <-readRDS(paste0( param$outdir_list$Pseudotime , "GAM_fittigGeneExp_addInfo.rds"))
+spe_subsetOBJ_m <- fitting_result[["marmoset"]]$seuratobj
+spe_subsetOBJ_h <- fitting_result[["human"]]$seuratobj
+spe_subsetOBJ_m$RNA_cluster<- factor( spe_subsetOBJ_m$seurat_clusters,levels = c(8,1,5,3,6,7))
+spe_subsetOBJ_h$RNA_cluster<- factor( spe_subsetOBJ_h$seurat_clusters,levels = c(8,1,5,3,6,7))
+
+#common_gene_ptime <- intersect( V(networklist_set[[1]]$graph)$name , V(networklist_set[[2]]$graph)$name )
+
+marmoset_ptime_gene <- lapply( fitting_result$marmoset$fitting,function(x){ return(x[1,1]) } ) %>% unlist
+human_ptime_gene    <- lapply( fitting_result$human$fitting,function(x){ return(x[1,1]) } ) %>% unlist
+common_gene_ptime <- intersect( marmoset_ptime_gene , human_ptime_gene )
+
+
+#########################################################
+# Compare Expression each bin
+#########################################################
+
+## Compare 
+# input
+Compare_obj_list <- list( "Marmoset" = spe_subsetOBJ_m ,"Human" = spe_subsetOBJ_h  )
+outdir <- param$outdir 
+cor_res_list <- list()
+
+Compare_obj_list <- lapply(Compare_obj_list ,function(x){ DefaultAssay(x) <-"RNA"; return(x)} )
+common_gene <- intersect( rownames(Compare_obj_list[[1]]) , rownames(Compare_obj_list[[2]]) )
+
+## CompareMarmoset_all_gene Bin
+outdir1 <- paste0(param$outdir ,"/Bin_cor_commonGene_marmoset_",sep="" )
+Compare_obj_list<- list( "Marmoset1" = spe_subsetOBJ_m ,"Marmoset2" = spe_subsetOBJ_m  )
+res_correlation<-MakeCorrelationPlot(Compare_obj_list , outdir1  ,common_gene = common_gene  , category = "bin", ht_title="Marmosets"  )
+cor_res_list[[length(cor_res_list)+1]]<- res_correlation
+output.file <- paste0( param$outdir , "/Bin_cor_commonGene_marmoset.txt")
+write.table(res_correlation$cormat , output.file ,quote = F ,col.names = NA,sep = "\t" )
+
+## CompareHuman_all_gene Bin
+outdir1 <- paste0(param$outdir ,"/Bin_cor_commonGene_human_",sep="" )
+Compare_obj_list<- list( "Human1" = spe_subsetOBJ_h ,"Human2" = spe_subsetOBJ_h  )
+res_correlation<-MakeCorrelationPlot(Compare_obj_list , outdir1  ,common_gene = common_gene  , category = "bin" , ht_title="Humans"  )
+cor_res_list[[length(cor_res_list)+1]]<- res_correlation
+output.file <- paste0( param$outdir , "/Bin_cor_commonGene_human.txt")
+write.table(res_correlation$cormat , output.file ,quote = F ,col.names = NA,sep = "\t" )
+
+## CompareMarmoset_all_gene Bin
+outdir1 <- paste0(param$outdir ,"/Cluster_cor_commonGene_marmoset_",sep="" )
+Compare_obj_list<- list( "Marmoset1" = spe_subsetOBJ_m ,"Marmoset2" = spe_subsetOBJ_m  )
+res_correlation<-MakeCorrelationPlot(Compare_obj_list , outdir1  ,common_gene = common_gene  , category = "RNA_cluster"  )
+cor_res_list[[length(cor_res_list)+1]]<- res_correlation
+output.file <- paste0( param$outdir , "/Cluster_cor_commonGene_marmoset.txt")
+write.table(res_correlation$cormat , output.file ,quote = F ,col.names = NA,sep = "\t" )
+
+## CompareHuman_all_gene Bin
+outdir1 <- paste0(param$outdir ,"/Cluster_cor_commonGene_human_",sep="" )
+Compare_obj_list<- list( "Human1" = spe_subsetOBJ_h ,"Human2" = spe_subsetOBJ_h  )
+res_correlation<-MakeCorrelationPlot(Compare_obj_list , outdir1  ,common_gene = common_gene  , category = "RNA_cluster"  )
+cor_res_list[[length(cor_res_list)+1]]<- res_correlation
+output.file <- paste0( param$outdir , "/Cluster_cor_commonGene_human.txt")
+write.table(res_correlation$cormat , output.file ,quote = F ,col.names = NA,sep = "\t" )
+
+#########################################################
+# Compare Expression speceis
+#########################################################
+
+## CompareMarmoset_all_gene bin
+outdir1 <- paste0(param$outdir ,"/Bin_cor_commonGene_Species_",sep="" )
+Compare_obj_list<- list( "Marmoset" = spe_subsetOBJ_m ,"Human" = spe_subsetOBJ_h  )
+res_correlation<-MakeCorrelationPlot(Compare_obj_list , outdir1  ,common_gene = common_gene  , category = "bin"  )
+cor_res_list[[length(cor_res_list)+1]]<- res_correlation
+output.file <- paste0( param$outdir , "/Bin_cor_commonGene_Species_.txt")
+write.table(res_correlation$cormat , output.file ,quote = F ,col.names = NA,sep = "\t" )
+
+## CompareMarmoset_all_gene Cluster
+outdir1 <- paste0(param$outdir ,"/Cluster_cor_commonGene_Species_",sep="" )
+Compare_obj_list<- list( "Marmoset" = spe_subsetOBJ_m ,"Human" = spe_subsetOBJ_h  )
+res_correlation<-MakeCorrelationPlot(Compare_obj_list , outdir1  ,common_gene = common_gene  , category = "RNA_cluster"  )
+cor_res_list[[length(cor_res_list)+1]]<- res_correlation
+output.file <- paste0( param$outdir , "/Cluster_cor_commonGene_Species.txt")
+write.table(res_correlation$cormat , output.file ,quote = F ,col.names = NA,sep = "\t" )
+
+
+rm_list <- GetRmObjList (ls() , standardt_obj_list =  standardt_obj_list)
+rm( list = rm_list)
+gc()
+
+```
+
+## Gene Clustering by Tsfeature
+
+```{r Glasso, include=TRUE ,height = 15,  width  =15}
+#+++++++++++++++++++++++++++++++++++++++++++
+# python setting
+#+++++++++++++++++++++++++++++++++++++++++++
+use_python(param$condapath, required = TRUE)
+# Pythonのfastdtwとscipyをインポート
+fastdtw <- import("fastdtw")
+scipy <- import("scipy.spatial.distance")
+
+#+++++++++++++++++++++++++++++++++++++++++++
+# read data
+#+++++++++++++++++++++++++++++++++++++++++++
+total_day = param$Info$Prediction$total_day
+bin_day= param$Info$Prediction$bin
+bin_range = 0:(total_day+1)
+
+fitting_result <-readRDS(paste0( param$outdir_list$Pseudotime , "GAM_fittigGeneExp_addInfo.rds"))
+
+#+++++++++++++++++++++++++++++++++++++++++++
+# Analysis
+#+++++++++++++++++++++++++++++++++++++++++++
+
+
+ClusterResult = list( human= NULL , marmoset =NULL )
+sil_widths_Result = list( human= NULL , marmoset =NULL )
+plan(multisession, workers = 15)  # コア数を制限
+
+registerDoFuture()
+for( spe in c("human" ,"marmoset")){
+  timeBin_data <-fitting_result[[spe]]$time.bin.data
+  sc.spline.fits <- fitting_result[[spe]]$fitting.gam 
+  sc.tc.data<-  converSplineToMat(spline.fits = sc.spline.fits ,
+                              bin_range= bin_range ,
+                              gene_col = "GeneID")
+  
+  ts_list <- apply(sc.tc.data$mat, 1, function(x) ts(x))
+  # 特徴量を抽出（デフォルトで複数の統計量を計算）
+  features <- tsfeatures(ts_list)
+  rownames(features) <- colnames(ts_list)
+  # k-medoidsクラスタリング特徴量ベース）
+  # クラスタ数の範囲
+  k_range <- 2:15
+  # 並列ループ
+  results <- foreach(k = k_range, .packages = c("cluster")) %dopar% {
+    pam_fit <- pam(features, k)
+    sil <- silhouette(pam_fit)
+    sil_width <- mean(sil[, 3])
+    list(k = k, sil_width = sil_width, pam_fit = pam_fit)
+  }
+  
+  # 結果の整理
+  sil_widths <- numeric(length(k_range))
+  clust_result_list <- vector("list", length(k_range))
+  
+  for (i in seq_along(results)) {
+    sil_widths[i] <- results[[i]]$sil_width
+    clust_result_list[[i]] <- results[[i]]$pam_fit
+  }
+  names(sil_widths) <- k_range
+  sil_widths_Result[[spe]] = sil_widths
+  ClusterResult[[spe]] =  clust_result_list
+}
+plan(sequential)
+
+
+output.file <- paste0( param$outdir_list$Pseudotime ,"/Tsfeature_human_silhouetteplot.pdf")
+pdf( file = output.file , height = 5 ,width = 7)
+plot(sil_widths_Result[["human"]])
+dev.off()
+
+output.file <- paste0( param$outdir_list$Pseudotime ,"/Tsfeature_marmoset_silhouetteplot.pdf")
+pdf( file = output.file , height = 5 ,width = 7)
+plot(sil_widths_Result[["marmoset"]])
+dev.off()
+
+k_selectionlist<-list( 
+  P1 = list("human" =  10, "marmoset" = 6),
+  P2 = list("human" =  10, "marmoset" = 6), ##
+  P3 = list("human" =  8, "marmoset" = 6),
+  P4 = list("human" =  10, "marmoset" = 6), ##
+  P5 = list("human" =  8, "marmoset" = 7)  ##
+  )
+
+
+#p3
+best_k_list = k_selectionlist[[param$PATTERN]]
+
+
+
+
+for( spe in c("human" ,"marmoset")){
+  # 2回目に高いシルエット幅のKを選ぶ
+  sil_widths =  sil_widths_Result[[spe]]
+  #plot(sil_widths)
+  best_k <-best_k_list[[spe]]
+  print(paste0("Spceies...", spe , "\n Choose best K = "))
+  print(best_k)
+  clust_result <- ClusterResult[[spe]][[best_k]]
+  # クラスタ割り当ての表示
+  print(table(clust_result$clustering))
+  
+  #シルエット幅の再計算
+  sil_widths <- numeric(length(k_range))
+  for (i in k_range) {
+    sil_widths[i] <- mean(silhouette(ClusterResult[[spe]][[i-1]])[,3])
+  }
+  
+  sil_widths[1] <-NA
+  output.file <- paste0( param$outdir_list$Pseudotime ,"/Tsfeature_", spe,"_silhouetteplot.pdf")
+  pdf( file = output.file , height = 5 ,width = 7)
+  plot(sil_widths)
+  dev.off()
+}
+
+Clusterrng_all_result <- list(
+  best_k_list = best_k_list,
+  sil_widths_Result = sil_widths_Result,
+  ClusterResult = ClusterResult
+)
+
+
+output.file <- paste0( param$outdir_list$Pseudotime , "/resultTSfeature_SelectedK_res.rds")
+saveRDS(Clusterrng_all_result , output.file)
+
+rm_list <- GetRmObjList (ls() , standardt_obj_list =  standardt_obj_list)
+rm( list = rm_list)
+gc()
+
+```
+
+
+## TF / ATAC Fitting
+
+```{r fitting TF /ATAC, include=TRUE ,height = 15,  width  =15}
+get_peaks_per_gene <- function(gr_resized, peak_rownames) {
+  # peak rownames → GRanges (例: "chr1-10000-11000" 形式)
+  peak_gr <- StringToGRanges(peak_rownames)  # Signac関数
+  gr_string <- GRangesToString(gr_resized)
+  # overlap: gr_resized(gene単位) × peaks
+  hits <- findOverlaps(gr_resized, peak_gr)
+  # gene_id → peaks list
+  gene_ids <- gr_resized$gene_id[queryHits(hits)]
+  peaks_hit <- peak_rownames[subjectHits(hits)]
+  #result <- split(peaks_hit, gene_ids)
+  hits %>% 
+    as.data.frame()%>% 
+    mutate( query_region = peak_rownames[subjectHits] ,
+            gene_name = gr_resized$gene_name[queryHits] ,
+            closest_region = gr_string[queryHits] ,
+            gene_id = gr_resized$gene_id[queryHits],
+            transcript_id =gr_resized$transcript_id[queryHits] ) %>%
+    select(-queryHits , -subjectHits) %>% 
+    distinct() %>%
+  return()  # named list: gene_id → character vector of peak names
+}
+
+#########################################################
+# LOAD_DATA
+#########################################################
+total_day = param$Info$Prediction$total_day +1
+bin_day= param$Info$Prediction$bin
+fitting_result <-readRDS(paste0( param$outdir_list$Pseudotime , "GAM_fittigGeneExp_addInfo.rds"))
+# GGM_nodeData_list <- readRDS(  paste0( param$outdir_list$GGM , "/Nerwork_NodeData.rds") )
+
+param$outdir <- paste0(param$directories$outdir,"/ATAC_TF/")
+if (!dir.exists(param$outdir)) {
+  dir.create(param$outdir, recursive = TRUE)
+  message("ディレクトリを作成しました: ", param$outdir)
+} else {
+  message("output ディレクトリは既に存在します: ", param$outdir)
+}
+
+#########################################################
+# ATAC data
+#########################################################
+# ATAC_fitting = list(  human = NULL , marmoset = NULL )
+
+for( spe in c("human" ,"marmoset")){
+
+  timeBin_data <-fitting_result[[spe]]$time.bin.data
+  sc.spline.fits <- fitting_result[[spe]]$fitting.gam
+  var.genes.sig <-  sapply(sc.spline.fits , function(x){x$GeneID[1] } )
+  ssc_cells <- timeBin_data$sds.data$Cell 
+  spe_atac_subsetOBJ <- fitting_result[[spe]]$atac_obj
+  
+  ######################
+  # ClosestFeature of Peak 
+  ######################
+  DefaultAssay(spe_atac_subsetOBJ) <-"ATAC"
+  annotations <- Annotation( spe_atac_subsetOBJ[["ATAC"]] )
+  transcript_annotationdt <- annotations[mcols(annotations)$type == "transcript",]
+  peak_region <- rownames(spe_atac_subsetOBJ)
+  gr_resized <- resize_by_strand_with_region_string(transcript_annotationdt ,up=1000 ,down = 500)
+  closest_genes <- ClosestFeature(spe_atac_subsetOBJ, 
+                                  regions = peak_region,
+                                  annotation = gr_resized )
+  if( !"transcript_id" %in% colnames( closest_genes) ){ 
+    colnames( closest_genes)[ colnames( closest_genes) == "tx_id" ] = "transcript_id"
+  }
+  
+  feature_closest_genes <-closest_genes[closest_genes$distance <= 500 ,
+                                        c("query_region" , "gene_name","distance" ,
+                                          "closest_region","gene_id", "transcript_id" ) ]
+  var.genes_closest_feature <- feature_closest_genes %>% filter(gene_name %in% var.genes.sig )
+    
+  #gene_closest_peak <- get_peaks_per_gene(gr_resized ,peak_region  )
+  #var.genes_closest_feature <- gene_closest_peak %>% filter(gene_name %in% var.genes.sig )
+
+  ###########################
+  ## select variable gene make cycle matrix
+  ###########################
+  Y <- spe_atac_subsetOBJ@assays$ATAC$data[var.genes_closest_feature$query_region, ssc_cells ] 
+  
+  vat.genes_check <-apply(Y, 1, function(x){
+      return( c( var =var(x) , mean=mean(x), exppct = sum(x>0)/length(x) ) ) }) %>%
+      t %>% as.data.frame() %>% 
+    mutate( region = rownames(.))%>%
+    mutate( GeneID = var.genes_closest_feature %>% filter(query_region== region) %>% pull(gene_name) )
+  
+  vat.genes_check <- vat.genes_check %>% 
+    group_by(GeneID) %>% 
+    slice_max(order_by = mean, n = 1) %>%
+    ungroup()
+  summary(vat.genes_check[,] )
+  
+  cell.ord <- timeBin_data$sds.data$Cell
+  pseudotime <- timeBin_data$sds.data %>% pull(time.idx) 
+  names(pseudotime) <- timeBin_data$sds.data %>% pull( Cell)
+  
+  #sc.spline.fits.atac <- fitSmoothSpline(Y , genes = vat.genes_check$region ,total_day = total_day,
+  #                                  cell.ord , pseudotime ,num.cores = 20 ,L1=timeBin_data)
+  sc.spline.fits.atac <-  fitSmoothGAM(Y ,genes =vat.genes_check$region , 
+                                         cell.ord ,
+                                         pseudotime , 
+                                         total_day = total_day , #外挿分を+1する
+                                         num.cores = 4 ,
+                                         L1=timeBin_data , k = 7)
+  
+  sc.spline.fits.atac.mod <- lapply(sc.spline.fits.atac ,function(x,feature_closest_genes ){ 
+    region = x$GeneID[1]
+    GeneID =feature_closest_genes%>% filter(query_region == region)%>%pull(gene_name)
+    x$GeneID <- GeneID
+    x$query_region <- region
+    return(x)
+    } ,feature_closest_genes=feature_closest_genes)
+  
+  fitting_result[[spe]]$atac_closet_gene.var = var.genes_closest_feature
+  fitting_result[[spe]]$atac_closet_gene = feature_closest_genes  
+  fitting_result[[spe]]$fitting.gam.atac = sc.spline.fits.atac
+  
+}
+
+output.file <- paste0( param$outdir_list$Pseudotime , "GAM_fittigGeneExp_addInfo_addATAC.rds")
+saveRDS(fitting_result , output.file, compress = FALSE)
+
+rm_list <- GetRmObjList (ls(), standardt_obj_list = standardt_obj_list)
+rm( list = rm_list)
+gc()
+
+
+```
+
+
+ 
+## Plot Exp Heatmap & subcluster gene
+
+```{r  ExpHeatmap, include=TRUE ,height = 15,  width  =15}
+## Input  : param ,subsetOBJ  ,timeBin_data , sc.spline.fits  , node_info
+## Output : plot
+
+#########################################################
+# LOAD_DATA
+#########################################################
+total_day = param$Info$Prediction$total_day +1
+bin_day= param$Info$Prediction$bin
+fitting_result <-readRDS(paste0( param$outdir_list$Pseudotime , "GAM_fittigGeneExp_addInfo_addATAC.rds"))
+#GGM_nodeData_list <- readRDS(  paste0( param$outdir_list$GGM , "/Nerwork_NodeData.rds") )
+GeneCluster_list <- readRDS( paste0( param$outdir_list$Pseudotime , "/resultTSfeature_SelectedK_res.rds") )
+
+
+param$outdir <- paste0(param$directories$outdir,"/Heatmap/")
+if (!dir.exists(param$outdir)) {
+  dir.create(param$outdir, recursive = TRUE)
+  message("ディレクトリを作成しました: ", param$outdir)
+} else {
+  message("output ディレクトリは既に存在します: ", param$outdir)
+}
+
+
+pandodir = paste0(param$directories$outdir,"/Pando/")
+humanPandoRes <- read.table(  paste0(pandodir, "/human_pando_module.txt")   )
+marmosetPandoRes <- read.table(  paste0(pandodir, "/marmoset_pando_module.txt")   )
+pandores <- list(human = humanPandoRes ,
+                 marmoset = marmosetPandoRes )
+
+pando_predictedTF <- list(human =  pandores$human$tf %>% unique() ,
+                          marmoset =  pandores$marmoset$tf %>% unique() )
+
+GGM_nodeData_list = list( "human" = NULL , "marmoset" = NULL )
+
+#spe ="human"
+
+for( spe in c("human" ,"marmoset")){
+
+  timeBin_data <-fitting_result[[spe]]$time.bin.data
+  sc.spline.fits <- fitting_result[[spe]]$fitting.gam
+  var.genes.sig <-  sapply(sc.spline.fits , function(x){x$GeneID[1] } )
+  best_k= GeneCluster_list$best_k_list[[spe]]
+  node_info <- GeneCluster_list$ClusterResult[[spe]][[best_k]]
+  node_info <- node_info$clustering %>% 
+    as.data.frame() %>% 
+    dplyr::rename( "Cluster"=".") %>%
+    mutate(Gene = rownames(.))
+
+  
+  #########################################################
+  # prep heatmap
+  #########################################################
+  #rna----------
+  sc.mat.rna <- converSplineToMat(spline.fits =sc.spline.fits, 
+                                     bin_range= 0:total_day, 
+                                     gene_col = "GeneID")
+  sc.tc.mus <- sc.mat.rna$mat
+  sc.tc.mus.scale <-  sc.mat.rna$scalemat
+  maxbin <- sc.mat.rna$maxbin
+  names(maxbin) <- rownames(sc.tc.mus)
+  
+  bin_anno_data <-table(timeBin_data$umap.sds$cluster, timeBin_data$umap.sds$time.idx) %>% 
+    as.matrix() %>% t
+  rownames(bin_anno_data) <- 0:(total_day)
+  
+  Cluster_lebels <- as.data.frame(maxbin) %>% 
+    rownames_to_column(var="Gene") %>% 
+    mutate(Cluster=node_info[Gene,"Cluster"]) %>% 
+    group_by(Cluster) %>% 
+    summarise(meanbin= mean(maxbin)) %>%
+    arrange(meanbin) %>%
+    pull(Cluster)
+  
+  gene_rank <- apply(sc.tc.mus,1,function(x){ which.max(x)}) %>% as.data.frame() 
+  colnames(gene_rank) <- "maxpos"
+  gene_rank <-  gene_rank %>% 
+                arrange(maxpos) %>%
+                mutate( GeneID = rownames(.)) %>%
+                mutate(GeneCluster = factor(node_info[GeneID,"Cluster"] ,levels = Cluster_lebels))
+  
+  gene_order_splitCluster <- gene_rank %>%   arrange( GeneCluster ,maxpos )%>%pull(GeneID)
+  
+  # set cluster color
+  num_Genecluster = length(unique(gene_order_splitCluster))
+  GeneCluster_col <- palettedt[1:num_Genecluster ]
+  names(GeneCluster_col) <- c(0:(num_Genecluster-1) )
+  
+  #########################################################
+  # Average Line Plot
+  #########################################################
+  pltodata <- sc.tc.mus.scale %>% 
+    as.data.frame() %>% 
+    mutate(Gene =rownames(.)) %>% 
+    pivot_longer( -Gene, names_to = "bin",values_to = "EXP" ) %>%
+    mutate(Cluster= node_info[Gene,"Cluster"] ) %>% 
+    group_by(Cluster ,bin,) %>%
+    summarise( AveExp = mean(EXP)) %>%
+    ungroup() %>%
+    mutate(bin = as.numeric(bin), Cluster = factor(Cluster,levels = Cluster_lebels ))
+  
+  p<- pltodata%>%
+    ggplot(aes(x=bin, y= AveExp , col=Cluster)) + 
+    geom_line( )+
+    geom_vline(xintercept = 21, linetype = "dotted")+
+    scale_color_manual( values = GeneCluster_col) +
+    theme_classic() + 
+    facet_wrap(vars(Cluster))
+  
+  output.file = paste0( param$outdir,"/preCheck_ClusterOrdeer_",spe,"_linePlot.pdf" )
+  ggsave( p, file =output.file , height = 7,width = 7 )
+  
+  
+  #########################################################
+  # plot heatmap
+  #########################################################
+  
+  ## col annotaion = bin
+  ha <- HeatmapAnnotation(
+    stacked_bar = anno_barplot(
+      bin_anno_data[1:(total_day+1), ],
+      bar_width = 1,
+      gp = gpar(fill =cluster_pallete),
+      border = TRUE,
+      axis = TRUE,
+      height = unit(4, "cm")
+   )
+  )
+  # row annotation = Gene
+  row_ha = rowAnnotation( GeneCluster = node_info[gene_order_splitCluster,"Cluster"] ,
+                          col = list(GeneCluster = GeneCluster_col ) )
+  
+  
+  output.file = paste0( param$outdir,"/before_subclusterFittedHeatmap_",spe,"_TSfeatureCluster_allGene_merge.pdf" )
+  pdf( file = output.file , height = 12 ,width = 6)
+  
+  p<-Heatmap(sc.tc.mus.scale[gene_order_splitCluster,] %>% as.matrix() ,
+                name = "Fitted Gene Exp", 
+                top_annotation = ha, 
+                #row_split = row_cluster ,
+                left_annotation = row_ha,
+                show_column_names = F,
+                show_row_names =  F,
+                cluster_columns = FALSE,
+                cluster_rows = FALSE )
+                ##width = unit(10, "cm"))
+  print(p)
+  dev.off()
+  #########################################################
+  # SplitCluster
+  #########################################################
+  
+  subCluster_List <- c()
+  ## Cluster 1 /5 を分離する
+  for (SplitCluster in Cluster_lebels) {
+    print( paste0("split Cluseter " , SplitCluster))
+    # SplitCluster <- 1
+    exstract_undif_CluseterGene <-  node_info %>% 
+          filter(Cluster %in% SplitCluster)  %>% 
+          pull(Gene)
+  　
+    subk = 5
+    # ユークリッド距離
+    dist_matrix <- dist(sc.tc.mus.scale[exstract_undif_CluseterGene,], method = "euclidean")
+    hc <- hclust(dist_matrix, method = "complete")
+    sub_distclusters <- cutree(hc, k = subk)
+    subCluster_List <- c(subCluster_List ,sub_distclusters )
+    
+
+  
+    # row annotation = Gene
+    subCluserOrder <- gene_rank %>% 
+      filter( GeneCluster == SplitCluster ) %>%
+      mutate( subCluster = sub_distclusters[GeneID])  %>% 
+      arrange( subCluster ,maxpos )%>%pull(GeneID)
+  
+    row_ha = rowAnnotation( GeneCluster = node_info[subCluserOrder,"GeneCluster"] ,
+                            SubCluster =  sub_distclusters[subCluserOrder],
+                            col = list(GeneCluster = GeneCluster_col , 
+                                       SubCluster = GeneCluster_col
+                                       ) )
+    
+    output.file = paste0( param$outdir,"/checkFittedHeatmap_",spe,"_SubClusterofC", SplitCluster,"_TSfeature.pdf" )
+    pdf( file = output.file , height = 12 ,width = 6)
+    p<-Heatmap(sc.tc.mus.scale[subCluserOrder,] ,
+                  name = "Fitted Gene Exp", 
+                  top_annotation = ha, 
+                  #row_split = row_cluster ,
+                  left_annotation = row_ha,
+                  show_column_names = F,
+                  show_row_names =  F,
+                  cluster_columns = FALSE,
+                  cluster_rows = FALSE )
+                  ##width = unit(10, "cm"))
+    print(p)
+    dev.off()
+  }
+  
+  GGM_nodeData_list[[spe]] <- node_info %>% 
+    mutate( SubCluster = subCluster_List[Gene] ) 
+}
+
+
+#########################################################
+# manual Sub Cluster 
+#########################################################
+## P3
+P3_manual_cluster <- list(
+  human = list(
+  "1" = c( "1" = "C1-1", "2" = "C1-1", "3"= "C1-1", "4" = "C1-1", "5" = "C1-2" ) , # 2 subcluster
+  "2" = c( "1" = "C2-1", "2" = "C2-1", "3"= "C2-2", "4" = "C2-2", "5" = "C2-3" ) , # 3 subcluster
+  "3" = c( "1" = "C3-1", "2" = "C3-1", "3"= "C3-1", "4" = "C3-1", "5" = "C3-1" ) , # 1 subcluster
+  "4" = c( "1" = "C4-1", "2" = "C4-1", "3"= "C4-2", "4" = "C4-2", "5" = "C4-2" ) , # 2 subcluster
+  "5" = c( "1" = "C5-1", "2" = "C5-2", "3"= "C5-3", "4" = "C5-4", "5" = "C5-4" ) , # 4 subcluster NoicyCluster
+  "6" = c( "1" = "C6-1", "2" = "C6-1", "3"= "C6-1", "4" = "C6-2", "5" = "C6-2" ) , # 2 subcluster  
+  "7" = c( "1" = "C7-1", "2" = "C7-2", "3"= "C7-3", "4" = "C7-3", "5" = "C7-4" ) , # 4 subcluster
+  "8" = c( "1" = "C8-1", "2" = "C8-1", "3"= "C8-2", "4" = "C8-2", "5" = "C8-1" ) , # 2 subcluster
+  "9" = c( "1" = "C9-1", "2" = "C9-1", "3"= "C9-1", "4" = "C9-2", "5" = "C9-2" )  # 2 subcluster
+  ) , 
+  marmoset = list(
+  "1" = c( "1" = "C1-1", "2" = "C1-1", "3"= "C1-1", "4" = "C1-2", "5" = "C1-1" ) , # 1 subcluster
+  "2" = c( "1" = "C2-1", "2" = "C2-1", "3"= "C2-1", "4" = "C2-2", "5" = "C2-2" ) , # 2 subcluster
+  "3" = c( "1" = "C3-1", "2" = "C3-1", "3"= "C3-2", "4" = "C3-2", "5" = "C3-3" ) , # 3 subcluster NoicyCluster
+  "4" = c( "1" = "C4-1", "2" = "C4-1", "3"= "C4-2", "4" = "C4-2", "5" = "C4-2" ) , # 2 subcluster
+  "5" = c( "1" = "C5-1", "2" = "C5-2", "3"= "C5-1", "4" = "C5-2", "5" = "C5-1" ) , # 2 subcluster 
+  "6" = c( "1" = "C6-1", "2" = "C6-1", "3"= "C6-2", "4" = "C6-1", "5" = "C6-2" ) , # 2 subcluster  
+  "7" = c( "1" = "C7-1", "2" = "C7-1", "3"= "C7-2", "4" = "C7-1", "5" = "C7-2" )  # 2 subcluster
+  )
+)
+
+## P5
+P5_manual_cluster <- list(
+  human = list(
+  "1" = c( "1" = "C1-1", "2" = "C1-2", "3"= "C1-1", "4" = "C1-2", "5" = "C1-1" ) , # 2 subcluster
+  "2" = c( "1" = "C2-1", "2" = "C2-2", "3"= "C2-2", "4" = "C2-3", "5" = "C2-2" ) , # 3 subcluster
+  "3" = c( "1" = "C3-1", "2" = "C3-1", "3"= "C3-1", "4" = "C3-1", "5" = "C3-1" ) , # 1 subcluster
+  "4" = c( "1" = "C4-1", "2" = "C4-1", "3"= "C4-1", "4" = "C4-1", "5" = "C4-1" ) , # 1 subcluster
+  "5" = c( "1" = "C5-1", "2" = "C5-1", "3"= "C5-1", "4" = "C5-1", "5" = "C5-2" ) , # 2 subcluster
+  "6" = c( "1" = "C6-1", "2" = "C6-2", "3"= "C6-2", "4" = "C6-2", "5" = "C6-1" ) , # 2 subcluster  
+  "7" = c( "1" = "C7-1", "2" = "C7-1", "3"= "C7-1", "4" = "C7-2", "5" = "C7-2" ) , # 2 subcluster
+  "8" = c( "1" = "C8-1", "2" = "C8-2", "3"= "C8-1", "4" = "C8-2", "5" = "C8-3" ) , # 3 subcluster
+  "9" = c( "1" = "C9-1", "2" = "C9-1", "3"= "C9-2", "4" = "C9-2", "5" = "C9-1" )  # 2 subcluster
+  ) , 
+  marmoset = list(
+  "1" = c( "1" = "C1-1", "2" = "C1-1", "3"= "C1-1", "4" = "C1-2", "5" = "C1-2" ) , # 2 subcluster
+  "2" = c( "1" = "C2-1", "2" = "C2-2", "3"= "C2-2", "4" = "C2-3", "5" = "C2-3" ) , # 3 subcluster
+  "3" = c( "1" = "C3-1", "2" = "C3-2", "3"= "C3-3", "4" = "C3-4", "5" = "C3-3" ) , # 4 subcluster NoicyCluster
+  "4" = c( "1" = "C4-1", "2" = "C4-1", "3"= "C4-1", "4" = "C4-2", "5" = "C4-2" ) , # 2 subcluster
+  "5" = c( "1" = "C5-1", "2" = "C5-2", "3"= "C5-3", "4" = "C5-3", "5" = "C5-3" ) , # 3 subcluster 
+  "6" = c( "1" = "C6-1", "2" = "C6-1", "3"= "C6-1", "4" = "C6-1", "5" = "C6-1" ) , # 1 subcluster  
+  "7" = c( "1" = "C7-1", "2" = "C7-1", "3"= "C7-1", "4" = "C7-2", "5" = "C7-2" ) , # 2 subcluster
+  "8" = c( "1" = "C8-1", "2" = "C8-2", "3"= "C8-1", "4" = "C8-2", "5" = "C8-3" )  # 3  subcluster
+  )
+)
+
+manual_cluster_Pattern <-list( 
+  P3 = P3_manual_cluster ,  ##
+  P5 = P5_manual_cluster  ##
+  )
+
+#########################################################
+# Rename Sub Cluster 
+#########################################################
+
+manual_cluster_list <- manual_cluster_Pattern[[param$PATTERN]]
+
+
+for( spe in c("human" ,"marmoset")){
+  manual_cluster <-manual_cluster_list[[spe]]
+  node_info <- GGM_nodeData_list[[spe]]
+
+  #node_info <-  node_info %>% 
+  #  mutate( SubCluster = subCluster_List[Node] ) 
+  node_info$ManualCluster <- NA
+  for( i in  c(1:nrow(node_info)) ){
+    C <- node_info[i , "Cluster"]
+    subC <-node_info[i , "SubCluster"]
+    node_info[i , "ManualCluster"] <- manual_cluster[[ C ]][ subC ]
+    
+  }
+   GGM_nodeData_list[[spe]] <- node_info
+}
+
+output.file <- paste0( param$outdir , "/Network_GGM_NodeDF_subCluster.rds")
+saveRDS(GGM_nodeData_list , output.file)
+
+rm_list <- GetRmObjList (ls(), standardt_obj_list = standardt_obj_list)
+rm( list = rm_list)
+gc()
+
+
+```
+
+
+## Plot:Pseudotime Cluster Heatmap PLot
+
+```{r Heatmap plot, include=TRUE ,height = 15,  width  =15}
+
+### Gene Order
+###
+### @input : param,SeuratOBJ , Category_list
+### @return : SeuratOBJ 
+
+# subfunction
+# クラスタ内の並び替え
+#A. ピーク時点 + ピーク強度での並び替え
+order_genes_within_cluster <- function(expr_data) {
+  # 各遺伝子のピーク時点
+  peak_time <- apply(expr_data, 1, which.max)
+  # ピーク時の発現強度
+  peak_intensity <- apply(expr_data, 1, max)
+  # ピーク時点で1次ソート、強度で2次ソート
+  order(peak_time, peak_intensity)
+}
+
+
+# subfunction
+#B. ピーク検出
+order_genes_smooth <- function(expr_data) {
+  peak_time <- apply(expr_data, 1, which.max)
+  peak_intensity <- apply(expr_data, 1, max)
+  order(peak_time, peak_intensity)
+}
+
+# subfunction
+#C. 二峰性対応：主要ピークと副次ピークの考慮
+order_genes_bimodal <- function(expr_data, threshold = 0.7) {
+  peak_info <- t(apply(expr_data, 1, function(x) {
+    # 正規化
+    x_norm <- (x - min(x)) / (max(x) - min(x))
+    
+    # 主ピーク
+    primary_peak <- which.max(x_norm)
+    primary_height <- max(x_norm)
+    
+    # 副次ピーク（主ピークの70%以上の高さ）
+    x_norm[primary_peak] <- 0
+    secondary_peak <- which.max(x_norm)
+    secondary_height <- max(x_norm)
+    
+    if (secondary_height > threshold) {
+      # 二峰性：早い方のピークを優先
+      effective_peak <- min(primary_peak, secondary_peak)
+    } else {
+      effective_peak <- primary_peak
+    }
+    
+    c(effective_peak, primary_height)
+  }))
+  
+  order(peak_info[, 1], peak_info[, 2])
+}
+
+
+# Main Function
+create_heatmap_order <- function(expression_matrix, gene_clusters, ordered_clusters = NULL) {
+  
+  if( is.null(ordered_clusters) ){
+    # クラスタ順序を決定
+    cluster_peak_times <- sapply(unique(gene_clusters), function(cl) {
+      cluster_expr <- expression_matrix[gene_clusters == cl, , drop = FALSE]
+      weighted.mean(1:ncol(cluster_expr), colMeans(cluster_expr))
+    })
+    ordered_clusters <- names(sort(cluster_peak_times, decreasing = TRUE))
+  }
+  # 各クラスタ内で遺伝子を並び替え
+  final_order <- c()
+  
+  for (cl in ordered_clusters ) {
+    cluster_genes_idx <- which(gene_clusters == cl)
+    cluster_expr <- expression_matrix[cluster_genes_idx, , drop = FALSE]
+    #print( length(cluster_genes_idx) )
+    # スムージング + 二峰性考慮の並び替え
+    within_order <- order_genes_bimodal(cluster_expr)
+    final_order <- c(final_order, cluster_genes_idx[within_order])
+  }
+  return(final_order)
+}
+
+#########################################################
+# Load Data
+#########################################################
+
+total_day = param$Info$Prediction$total_day +1
+bin_day= param$Info$Prediction$bin
+fitting_result <-readRDS(paste0( param$outdir_list$Pseudotime , "GAM_fittigGeneExp_addInfo_addATAC.rds"))
+GGM_nodeData_list <- readRDS(  paste0( param$directories$outdir , "/Heatmap//Network_GGM_NodeDF_subCluster.rds")) 
+#LINGERres_trans_edges_AddGMM
+
+param$outdir <- paste0(param$directories$outdir,"/Heatmap_subClusted_num50/")
+if (!dir.exists(param$outdir)) {
+  dir.create(param$outdir, recursive = TRUE)
+  message("ディレクトリを作成しました: ", param$outdir)
+} else {
+  message("output ディレクトリは既に存在します: ", param$outdir)
+}
+
+
+if( file.exists(paste0( param$outdir,"ManualClusterPalette.RDS")) ){
+  ManualClusterPalette <-  readRDS(paste0(  param$outdir,"ManualClusterPalette.RDS"))
+}else{
+  ManualClusterPalette <- createPalette(40,　seedcolors=  c("#010101", "#ff0000"), M = 1000,prefix=NA)
+  saveRDS(ManualClusterPalette, paste0( param$outdir,"ManualClusterPalette.RDS"))
+}
+
+
+pandodir = paste0(param$directories$outdir,"/Pando/")
+humanPandoRes <- read.table(  paste0(pandodir, "/human_pando_module.txt")   )
+marmosetPandoRes <- read.table(  paste0(pandodir, "/marmoset_pando_module.txt")   )
+pandores <- list(human = humanPandoRes ,
+                 marmoset = marmosetPandoRes )
+
+pando_predictedTF <- list(human =  pandores$human$tf %>% unique() ,
+                          marmoset =  pandores$marmoset$tf %>% unique() )
+TF_list <- motif2tf$tf %>% unique
+
+# RealTimedata
+brdu_perid = 6.63*7
+predicted_realTime <- list( "human" = NULL , "marmoset" = NULL)
+for ( spe in c("human", "marmoset" )){
+  timebin_data <-  fitting_result[[spe]]$time.bin.data
+  predicted_realTime[[spe]] <- PredTime(timebin_data,brdu_perid  )
+}
+
+
+
+#########################################################
+# RNA_exp
+#########################################################
+
+P3_ordered_clusters <- list(
+  human = c( "C9-2", "C3-1", "C4-2", "C4-1", "C9-1", "C7-3", "C8-2", "C7-2", "C5-2", "C6-2", 
+             "C7-1", "C2-3", "C8-1", "C6-1", "C7-4", "C2-2", "C2-1", "C1-1", "C1-2", "C5-3", 
+             "C5-1","C5-4"),
+  marmoset = c("C6-1", "C6-2", "C7-1","C4-2", "C3-1", "C4-1", "C5-1", "C5-2", "C2-1","C1-1",
+               "C1-2", "C2-2", "C7-2", "C3-2", "C3-3")
+)
+
+
+P5_ordered_clusters  <- list(
+  human = c("C5-1", "C6-2","C6-1", "C8-1", "C9-1","C7-1","C2-1", "C1-2","C4-1","C3-1",
+            "C1-1","C5-2","C2-3","C8-3","C2-2","C7-2","C9-2","C8-2"),
+  marmoset = c("C7-1","C7-2","C4-1","C4-2","C8-2","C8-1","C5-3","C5-2","C2-2","C1-2","C6-1",
+               "C2-1",  "C1-1"  ,"C2-3", "C3-1","C3-2", "C5-1", "C3-3" ,"C3-4", "C8-3"
+  )
+)
+
+ordered_clusters_Pattern <-list( 
+  P3 = P3_ordered_clusters ,  ##
+  P5 = P5_ordered_clusters  ##
+  )
+
+ordered_clusters <- ordered_clusters_Pattern[[param$PATTERN]]
+
+HighlightGene <- NULL #c( "CLOCK", "ARNTL2", "SMAD4", "FOXP1",
+                    #"HBP1", "MGA", "TFAP2A", "PPARG", "RUNX1","RUNX2","STAT1","SMAD2")
+
+# spe = "human"
+numHighlightlimit = 5
+numHighlight = 50
+
+AverageEXP_mat = list(human=NULL,marmoset=NULL)
+
+for( spe in c("human" ,"marmoset")){
+
+  timeBin_data <-fitting_result[[spe]]$time.bin.data
+  sc.spline.fits <- fitting_result[[spe]]$fitting.gam
+  spe_subsetOBJ <- fitting_result[[spe]]$seuratobj
+  var.genes.sig <-  sapply(sc.spline.fits , function(x){x$GeneID[1] } )
+  node_info <- GGM_nodeData_list[[spe]]
+  
+  predicted_realTime_spe <- predicted_realTime[[spe]] %>%
+    select(- PredDay) %>%
+    rename( "bin" = "time.idx", "PredDay" =  "end" ) %>%
+    select( bin,PredDay )
+  
+  #########################################################
+  # prep heatmap
+  #########################################################
+  #rna----------
+  sc.mat.rna <- converSplineToMat(spline.fits =sc.spline.fits, 
+                                     bin_range= 0:total_day, 
+                                     gene_col = "GeneID")
+  sc.tc.mus <- sc.mat.rna$mat
+  sc.tc.mus.scale <-  sc.mat.rna$scalemat
+  maxbin <- sc.mat.rna$maxbin
+  names(maxbin) <- rownames(sc.tc.mus)
+  
+  spe_subsetOBJ <-ScaleData(spe_subsetOBJ, features = rownames(sc.tc.mus))
+  
+  #--
+  # クラスタごとの発現ピーク時点を計算
+  gene_clusters <- node_info[ rownames(sc.tc.mus.scale),"ManualCluster" ]
+  
+  cluster_order_val <- sapply(unique(gene_clusters), function(cl) {
+    cluster_genes <- sc.tc.mus.scale[gene_clusters == cl, ]
+    # 各クラスタの平均発現パターン
+    avg_pattern <- colMeans(cluster_genes)
+    # 重心（weighted mean of timepoints）
+    weighted.mean(1:ncol(cluster_genes), avg_pattern)
+  })
+  
+  #cluster_order <- order(cluster_order_val)
+  ordered_clusters_spe <- ordered_clusters[[spe]]
+  gene_order_splitCluster <- rownames(sc.tc.mus.scale)[create_heatmap_order(sc.tc.mus.scale,
+                                                                            gene_clusters,ordered_clusters_spe)]
+  # node_info[ gene_order_splitCluster, "ManualCluster" ]
+  gene_order = gene_order_splitCluster
+  Cluster_lebels <- ordered_clusters_spe
+  #--
+  
+  bin_anno_data <-table(timeBin_data$umap.sds$cluster, timeBin_data$umap.sds$time.idx) %>% 
+    as.matrix() %>% t
+  rownames(bin_anno_data) <- 0:(total_day)
+  
+  # set cluster color
+  num_Genecluster = length(Cluster_lebels)
+  GeneCluster_col <- palettedt[1:num_Genecluster ]
+  names(GeneCluster_col) <- c(0:(num_Genecluster-1) )
+
+  #########################################################
+  # Average Line Plot
+  #########################################################
+  
+  DefaultAssay(spe_subsetOBJ) <- "RNA"
+  AverageEXP_bin <- AverageExpression(spe_subsetOBJ , 
+                      group.by = "bin" , assays = "RNA")$RNA[ rownames( sc.tc.mus.scale),] %>%
+    as.data.frame %>% t %>% scale()%>%t%>% as.data.frame() %>%
+    rownames_to_column(var = "Gene") %>%
+    pivot_longer( -Gene, names_to = "bin",values_to = "EXP" ) %>%
+    mutate(bin = gsub("g","",bin) , Cluster= node_info[Gene,"Cluster"] ) %>% 
+    group_by(Cluster ,bin,) %>%
+    summarise( NonFittedEXP = mean(EXP)) %>%
+    ungroup() %>%
+    mutate(bin = as.numeric(bin), Cluster = factor(Cluster))
+    
+  pltodata <- sc.tc.mus.scale %>% 
+    as.data.frame() %>% 
+    mutate(Gene =rownames(.)) %>% 
+    pivot_longer( -Gene, names_to = "bin",values_to = "EXP" ) %>%
+    mutate(Cluster= node_info[Gene,"Cluster"] ) %>% 
+    group_by(Cluster ,bin,) %>%
+    summarise( AveExp = mean(EXP)) %>%
+    ungroup() %>%
+    mutate(bin = as.numeric(bin), Cluster = factor(Cluster ))
+  
+  p<- left_join(pltodata , AverageEXP_bin, by = c("Cluster" ,"bin") ) %>%ungroup() %>%
+    ggplot() + 
+    geom_line(aes(x=bin, y= AveExp , col=Cluster) ,size = 1   )+
+    geom_vline(xintercept = 21, linetype = "dotted")+
+    geom_point( aes( x = bin , y= NonFittedEXP) , size = 0.8) + 
+    scale_color_manual( values = GeneCluster_col) +
+    theme_classic() +  theme(text=element_text(size=20))+ 
+    facet_wrap(vars(Cluster))+
+    labs(title = paste0(str_to_title(spe),"s") )+
+    theme(plot.title = element_text(hjust = 0.5))
+    
+  
+  output.file = paste0( param$outdir,"/ClusterOrdeer_linePlot_",spe,"_" )
+  wggplot( p, file =output.file , height = 9,width = 12 )
+  
+  #pltodata$Cluster %>%unique() %>% length()
+  MCluster_list = Cluster_lebels # node_info[gene_order_splitCluster,"ManualCluster"] %>%unique()
+  names(ManualClusterPalette)[1:length(MCluster_list)] <- MCluster_list
+  
+
+  ManualClusterAverageEXP_bin <-AverageExpression(spe_subsetOBJ , 
+                      group.by = "bin" , assays = "RNA")$RNA[ rownames( sc.tc.mus.scale),] %>%
+    as.data.frame %>% t %>% scale()%>%t%>% as.data.frame() %>%
+    rownames_to_column(var = "Gene") %>%
+    pivot_longer( -Gene, names_to = "bin",values_to = "EXP" ) %>%
+    mutate(bin = gsub("g","",bin) , ManualCluster= node_info[Gene,"ManualCluster"] ) %>% 
+    group_by(ManualCluster ,bin,) %>%
+    summarise( NonFittedEXP = mean(EXP)) %>%
+    ungroup() %>%
+    mutate(bin = as.numeric(bin) )
+  
+  for( i in node_info$Cluster %>% unique() ){
+    
+   pltodata <-  sc.tc.mus.scale %>% 
+    as.data.frame() %>% 
+    mutate(Gene =rownames(.)) %>% 
+    pivot_longer( -Gene, names_to = "bin",values_to = "EXP" ) %>%
+    mutate(Cluster= node_info[Gene,"Cluster"] ,
+           SubCluster = node_info[Gene,"SubCluster"],
+           ManualCluster = node_info[Gene,"ManualCluster"]
+           ) %>% 
+    filter( Cluster == i ) %>%
+    group_by(ManualCluster ,bin) %>%
+    summarise( AveExp = mean(EXP)) %>%
+    ungroup() %>%
+    mutate(bin = as.numeric(bin), ManualCluster = factor(ManualCluster ) )
+   
+   numcluster =  pltodata$ManualCluster %>%unique() %>% length()
+   
+   p<- left_join(pltodata , ManualClusterAverageEXP_bin, by = c("ManualCluster" ,"bin") ) %>%
+     ungroup() %>%
+    ggplot() + 
+    geom_line(aes(x=bin, y= AveExp , col=ManualCluster) ,size = 1   )+
+    geom_vline(xintercept = 21, linetype = "dotted")+
+    geom_point( aes( x = bin , y= NonFittedEXP) , size = 0.5) + 
+    scale_color_manual( values = ManualClusterPalette) +
+    theme_classic() + 
+    facet_wrap(vars(ManualCluster))
+    output.file = paste0( param$outdir,"/SubCluster_",spe,"_C",i,"_linePlot_cycleFit" )
+  
+    if( numcluster ==1){
+      h=2
+      w=4
+    } else if( numcluster ==2){
+      h=2
+      w=6
+    } else if( numcluster ==3){
+      h=2
+      w=6
+    }  else if( numcluster ==4){
+      h=4
+      w=6
+    }  else if( numcluster ==5){
+      h=4
+      w=6
+    }
+    wggplot( p, file =output.file , height = h ,width = w) 
+  }
+
+  #########################################################
+  # Common Heatmap
+  #########################################################
+  ## col annotaion = bin 一度だけ作る
+  # 共通変数まとめる
+  heatmapCommon_param  <- list(bin_anno_data = bin_anno_data,
+                               cluster_pallete = cluster_pallete,
+                               node_info = node_info,
+                               GeneCluster_col = GeneCluster_col , 
+                               ManualClusterPalette= ManualClusterPalette,
+                               HighlightGene = NULL,
+                               #LINGERres_trans_edges_AddGMM = LINGERres_trans_edges_AddGMM,
+                               pandores = pandores[[spe]],
+                               Highlightcoldt = c("red","black")
+                               )
+  
+
+
+  #########################################################
+  # plot heatmap no fitting data
+  #########################################################
+  
+  # rna no fitting data --------------------
+  spe_subsetOBJ <-ScaleData(spe_subsetOBJ, features = rownames(sc.tc.mus))
+  spe_subsetOBJ@meta.data[ timeBin_data$umap.sds$Cell,"bin" ] <- timeBin_data$umap.sds[, "time.idx"]
+  sc.mat.rna.ave= AverageExpression( spe_subsetOBJ  , assays = "RNA" ,
+                                     group.by = "bin",layer = "scale.data" )$RNA[rownames(sc.tc.mus),]
+  colnames(sc.mat.rna.ave) <- 0:total_day
+
+  ht_nofit <-Plot_binHeatmap( heatmapCommon_param = heatmapCommon_param,
+        gene_order = gene_order_splitCluster,
+        binmatrix = sc.mat.rna.ave , 
+        numHighlight=numHighlight, 
+        numHighlightlimit= numHighlightlimit , 
+        mainname = "Gene Exp",
+        )
+  
+  output.file = paste0( param$outdir,"/NotFittedHeatmap_TSfeatureCluster_allGene_merge_",spe,".pdf" )
+  pdf( file = output.file , height = 14 ,width = 12)
+  ht_drawn <-draw(ht_nofit)
+    decorate_annotation("  PredictedDay", {
+      min_day <- min(predicted_realTime_spe $PredDay)
+      max_day <- max(predicted_realTime_spe $PredDay)
+      
+      x_pos <- unit((predicted_realTime_spe $bin + 0.5) / 44, "npc")
+      y_pos <- unit((predicted_realTime_spe $PredDay - min_day) / (max_day - min_day), "npc")
+      grid.lines(x = x_pos, y = y_pos,
+                 gp = gpar(col = "black", lwd = 2))
+      
+      pushViewport(viewport(xscale = c(0,1), 
+                            yscale = c(min_day, max_day)))
+      tick_at <- pretty(c(min_day, max_day), n = 5)
+      tick_at <- tick_at[tick_at >= min_day & tick_at <= max_day]
+      grid.yaxis(main = FALSE,
+                 at = tick_at,
+                 gp = gpar(fontsize = 8))
+      popViewport()
+    })
+  dev.off()
+  
+  output.file = paste0( param$outdir,"/NotFittedHeatmap_TSfeatureCluster_allGene_merge_",spe,".png" )
+  png( file = output.file , height = 1400 ,width = 1200)
+  ht_drawn <-draw(ht_nofit)
+    decorate_annotation("  PredictedDay", {
+      min_day <- min(predicted_realTime_spe $PredDay)
+      max_day <- max(predicted_realTime_spe $PredDay)
+      
+      x_pos <- unit((predicted_realTime_spe $bin + 0.5) / 44, "npc")
+      y_pos <- unit((predicted_realTime_spe $PredDay - min_day) / (max_day - min_day), "npc")
+      grid.lines(x = x_pos, y = y_pos,
+                 gp = gpar(col = "black", lwd = 2))
+      
+      pushViewport(viewport(xscale = c(0,1), 
+                            yscale = c(min_day, max_day)))
+      tick_at <- pretty(c(min_day, max_day), n = 5)
+      tick_at <- tick_at[tick_at >= min_day & tick_at <= max_day]
+      grid.yaxis(main = FALSE,
+                 at = tick_at,
+                 gp = gpar(fontsize = 8))
+      popViewport()
+    })
+  dev.off()
+  
+  spe_subsetOBJ <- NormalizeData(spe_subsetOBJ ,assay = "RNA" )
+  sc.mat.rna.ave_nolog = AverageExpression( spe_subsetOBJ  , assays = "RNA" ,
+                                     group.by = "bin",layer = "data" )$RNA[rownames(sc.tc.mus),]
+  colnames(sc.mat.rna.ave_nolog) <- 0:total_day
+  AverageEXP_mat[[spe]] <- sc.mat.rna.ave_nolog[gene_order_splitCluster,]
+  
+  output.file = paste0( param$outdir,"/NotFittedHeatmap_EXP_mat_",spe,".txt" )
+  write.table( sc.mat.rna.ave_nolog[gene_order_splitCluster,]  , file =output.file , 
+               quote = F ,sep ="\t" ,row.names = T ,col.names = NA)
+  
+}
+
+
+
+wb_tf <- createWorkbook()
+customStyle <- createStyle(
+  fontName = "Arial",
+  fontSize = 11,halign = "center",valign = "center"
+  #textDecoration = "bold"
+)
+
+# --- シート1: human ---
+sheet <- paste0("HumanPseudotimeAverageEXP")
+addWorksheet(wb_tf,sheet)
+write_data<-AverageEXP_mat[["human"]]  %>% as.data.frame()
+writeData(wb_tf, sheet, write_data ,rowNames = TRUE )
+addFilter(wb_tf, sheet = sheet, 
+          rows = 1, 
+          cols = 1:(ncol(write_data)))
+freezePane(wb_tf, sheet = sheet, firstActiveRow = 2, firstActiveCol = 2)
+addStyle(wb_tf, sheet = sheet, style = customStyle, 
+         rows = 1:(nrow(write_data)+2) , 
+         cols = 1:(ncol(write_data)+1),
+         gridExpand = TRUE)
+
+# --- シート2: marmoset ---
+sheet <-  paste0("MarmosetPseudotimeAverageEXP")
+addWorksheet(wb_tf,sheet)
+write_data<-AverageEXP_mat[["marmoset"]] %>% as.data.frame()
+writeData(wb_tf, sheet, write_data ,rowNames = TRUE )
+addFilter(wb_tf, sheet = sheet, 
+          rows = 1, 
+          cols = 1:(ncol(write_data)+1))
+freezePane(wb_tf, sheet = sheet, firstActiveRow = 2, firstActiveCol = 2)
+addStyle(wb_tf, sheet = sheet, style = customStyle, 
+         rows = 1:(nrow(write_data)+2) , 
+         cols = 1:(ncol(write_data)+2),
+         gridExpand = TRUE)
+
+outfile  = paste0(param$outdir , "/Pseudotime_AverageExp_matrix.xlsx" )
+saveWorkbook(wb_tf, file =outfile, overwrite = TRUE)
+
+
+
+
+rm_list <- GetRmObjList (ls() , standardt_obj_list =  standardt_obj_list)
+rm( list = rm_list)
+gc()
+
+
+```

@@ -1,0 +1,464 @@
+---
+title: "Integrate ATAC data"
+subtitle: "Marmoset"
+doc_type: 作業報告書
+author: 株式会社ダイナコム 久世、佐藤、江端
+date: "`r format(Sys.time(), '%Y年%m月%d日')`"
+output:
+    html_document:
+        toc: true
+        toc_depth: 4
+        toc_float:    # 目次は固定にしない
+          collapsed: false
+        number_section: true
+        pandoc_args: ["--from", "markdown+autolink_bare_uris+tex_math_single_backslash-implicit_figures"]
+        self_contained: False
+---
+
+```{=html}
+<!-- 
+sample1
+sample1
+merge
+Integrate
+
+QC & preprocess
+PCA / UMAP / Cluster/ CellCycle / FeatureGene / DEG
+
+-->
+```
+
+<!-- 画像をクリックすると拡大表示するjs -->
+```{js echo=FALSE}
+$(function(){
+  $("img:not(.lb-image)").wrap(function() {
+    return "<a href='" + $(this).attr("src") + "' data-lightbox='" + $(this).attr("scr") + "'></a>";
+  });
+});
+```
+
+## Load Library
+
+```{r setup, include=F ,echo =T}
+setwd("/Analysis/work/")
+
+# ライブラリ読み込み先を指定
+.libPaths()
+knitr::opts_chunk$set(echo = TRUE)
+
+#library(monocle3)
+library(Seurat)
+library(SeuratData)
+library(SeuratWrappers)
+library(ggplot2)
+library(patchwork)
+library(magrittr)
+library(dplyr)
+library(tidyverse)
+library(cowplot)
+library(yaml)
+library(DT)
+library(ggplot2)
+library(Polychrome)
+library(Signac)
+
+library(BSgenome.Cjacchus.UCSC.calJac4)
+
+set.seed(1234)
+options(future.globals.maxSize = 1e10)
+```
+
+## READ YAML
+
+```{r ReadYAML, include=FALSE, echo =F}
+# 引数で指定できるように
+yaml_file = "/Analysis/work//work_kuze/conf/IntegrateATAC_Marmoset.yaml"
+param <- yaml.load_file(yaml_file)
+
+
+#ディレクトリマップ
+dir_map <- param$directories
+
+# 各ファイルのフルパスを構築
+file_paths <- lapply(param$files, function(f) {
+  fs::path(dir_map[[f$dir]], f$name)
+})
+
+out_paths <- lapply(param$outfiles, function(f) {
+  fs::path(dir_map[[f$dir]], f$name)
+})
+
+# 名前付きリストに変換
+names(file_paths) <- names(param$files)
+names(out_paths) <- names(param$outfiles)
+
+param$files <- file_paths
+param$outfiles <- out_paths
+
+# outdirがなければ作成
+dir_path <- param$directories$outdir
+# ディレクトリの存在を確認し、存在しない場合は作成
+if (!dir.exists(dir_path)) {
+  dir.create(dir_path, recursive = TRUE)
+  message("ディレクトリを作成しました: ", dir_path)
+} else {
+  message("output ディレクトリは既に存在します: ", dir_path)
+}
+
+if (!is.null(param$pca_ndim)){
+  param$pca_ndim <-  eval(parse(text = param$pca_ndim)) 
+  # param$monocle.useCluster <- eval(parse(text = param$monocle.useCluster)) 
+}
+param$outdir <- param$directories$outdir
+print(param)
+
+```
+
+```{r Make color palet , include= TRUE}
+#set.seed(1234)
+#palette <- createPalette(20,　seedcolors=  c("#010101", "#ff0000"), M = 1000,prefix="NA")
+#palette <- readRDS("../work/out_20250709_hdWGCNA/def.pallet.rds")
+palettedt <- readRDS( param$colerPalet)
+names(palettedt) <- NULL
+# カラーパレットを表示します
+print(palettedt)
+# カラーパレットを視覚的に確認するためのプロット
+swatch(palettedt)
+```
+
+## Function
+```{r function,}
+## Exapnle
+#Category_list <- list(
+#  SSCs =  c(1,2,4,5,8) ,
+#  Differentiation = c(0,3,6),
+#  Other = c(7,9,10,11,12)
+#)
+SetCellAnnotation  <- function(param,SeuratOBJ,Category_list, from_cname ="seurat_clusters"){
+
+  from_val_list <- c()
+  to_val_list <- c()
+  for (i in c(1:length(Category_list)) ){
+    for (l in c(1:length(Category_list[[i]]))){
+      from_val_list <- c( from_val_list,Category_list[[i]][l] )
+      to_val_list <- c(to_val_list,names(Category_list)[i] )
+    }
+  }
+  category_change_list <- cbind( from =from_val_list , to =to_val_list )  %>% as.data.frame()
+  # from val not unique or uique chek
+  if( length(unique(category_change_list$from)) != nrow(category_change_list) ) {
+    print( "ERR!! from val not uniq !!")
+    return(0)
+  }
+  rownames(category_change_list) <- category_change_list$from
+  print(category_change_list)
+
+  # make New metadate 
+  CellType_meta <- SeuratOBJ@meta.data %>% 
+    as.data.frame() %>% 
+    mutate( !!sym(from_cname) := as.character(!!sym(from_cname)) ) %>%
+    mutate( CellType = category_change_list[ !!sym(from_cname), "to" ] ) %>%
+    pull( CellType )
+  return(CellType_meta)
+}
+
+### Check CellCycle Score
+###
+### @input : praram ,SeuratOBJ,cluster_pallete
+### @return : None
+
+plotCellCycle <- function(param ,SeuratOBJ,cluster_pallete ){
+  p<-DimPlot( SeuratOBJ ,group.by = "seurat_clusters",cols = cluster_pallete )
+  output.file = paste0( param$outdir,"/umap_allCell.pdf" )
+  ggsave( p , file =output.file , height = 5,width = 5 )
+  
+  p <-VlnPlot( SeuratOBJ,features=c("S.Score", "G2M.Score" ),n = 2, group.by ="seurat_clusters" , pt.size = 0) +
+          theme(text = element_text(size = 20))
+  output.file = paste0( param$outdir,"/vinplot_S_G2Mscore_all.pdf" )
+  ggsave( p , file =output.file , height = 5,width = 10 )
+  return(0)
+}
+
+
+### Set CellCycle & Cluster Category
+###
+### @input : param,SeuratOBJ,CellCycle_th=0.25,cc.genes
+### @return : SeuratOBJ , 
+SetCellCycle <- function(param,SeuratOBJ,CellCycle_th=0.25,cc.genes){
+  #CellCycle_th <- 0.25
+  s.genes <- cc.genes$s.genes
+  s.genes <-  intersect(s.genes , rownames(SeuratOBJ))
+  
+  SeuratOBJ$rePhase <-SeuratOBJ@meta.data%>% 
+    as.data.frame() %>%
+    select( "S.Score" ,"G2M.Score" ) %>%
+    apply(. , 1 , function(x,CellCycle_th){
+      if(x[1] < CellCycle_th & x[2] < CellCycle_th ){
+        return("G1")
+      } else if(x[1] >= CellCycle_th & x[2] < CellCycle_th ){
+        return("S")
+      } else if(x[1] < CellCycle_th & x[2] >= CellCycle_th ){
+        return("G2M")
+      } else if(x[1] >= CellCycle_th & x[2] >= CellCycle_th ){
+        if( x[1] > x[2]){
+          return("S")
+        } else{
+          return("G2M")
+        }
+        return("S")
+      }
+    },CellCycle_th=CellCycle_th)
+  
+  p<-DimPlot( SeuratOBJ ,group.by = c("rePhase","Phase") ,pt.size = 0.2) 
+  output.file = paste0( param$outdir,"/umap_Compare_S_G2M.pdf" )
+  ggsave( p , file =output.file , height = 5,width = 10 )
+  
+  #output.file  <- paste0( param$outdir,"/ClusterCount_mat.txt" )
+  #CellCount <- SeuratOBJ@meta.data %>% 
+  #  select("rePhase" ,"seurat_clusters" , "CellType" )
+  #write.table( CellCount , file =output.degfile , quote = F ,sep ="\t" ,row.names = F )
+
+  return( SeuratOBJ)
+}
+
+```
+
+
+## Import Seurat
+
+```{r Read_old data, include=TRUE}
+#marmoset
+SeuratOBJ <- readRDS(param$files$SeuratOBJ)
+DefaultAssay(SeuratOBJ) <-"RNA"
+SeuratOBJ[["RNA"]] <- JoinLayers(SeuratOBJ[["RNA"]])
+
+# set cluster color
+num_cluster = length(unique(SeuratOBJ$seurat_clusters))
+cluster_pallete <- palettedt[1:num_cluster ]
+names(cluster_pallete) <- c(0:(num_cluster-1) )
+```
+
+```{r push ATAC data , include=TRUE}
+
+# peak combined
+atac_peak_list <- list()
+for ( i in c(1:length(param$sampleName )) ) {
+  sampleID = param$sampleName[i]
+  datapath =param$sample[i]
+  
+  peak.file = paste0(datapath ,"atac_peaks.bed")
+  peaksdata <- read.table(
+    file = peak.file,
+    col.names = c("chr", "start", "end")
+  )
+  atac_peak_list[[i]] <-makeGRangesFromDataFrame(peaksdata)
+}
+
+if (length(atac_peak_list)==2 ) {
+  combined.peaks <- Signac::reduce(x = c( atac_peak_list[[1]] , atac_peak_list[[2]]) )
+} else if( length(atac_peak_list)==1){
+  combined.peaks <- atac_peak_list[[1]] 
+} else{
+  print("Warn!! samle > ")
+  return(0)
+}
+rm(atac_peak_list)
+gc()
+
+# Filter out bad peaks based on length
+peakwidths <- width(combined.peaks)
+combined.peaks <- combined.peaks[peakwidths  < 10000 & peakwidths > 20]
+combined.peaks
+
+#annotations_test <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+annotations <-  rtracklayer::import(param$files$gtf)
+seqlevelsStyle(annotations) <- 'UCSC'
+genome(annotations) <- param$spedb
+atac_assay_list <- list()
+
+for ( i in c(1:length(param$sampleName )) ) {
+  sampleID = param$sampleName[i]
+  datapath =param$sample[i]
+  gex_bcname <- SeuratOBJ@meta.data %>%
+    dplyr::filter( orig.ident == sampleID) %>%
+    rownames()
+  gex_barcodeList <-  gex_bcname %>% 
+            gsub( paste0(sampleID,"_"),"",.)
+  names(gex_barcodeList) <- gex_bcname
+  # create fragment objects
+  frag.file = paste0(datapath,"/atac_fragments.tsv.gz")
+  frags.data <- CreateFragmentObject(path = frag.file,cells = gex_barcodeList )
+
+  atac.counts <- FeatureMatrix( fragments = frags.data, features =combined.peaks , cells = gex_bcname )
+  atac_assay_list[[i]] <- CreateChromatinAssay(counts = atac.counts, fragments = frags.data  , annotation = annotations )
+}
+
+#atac_assay_list <- readRDS("atac_assay_list.rds")
+
+if (length(atac_assay_list)==2 ) {
+  mergedAtac <- merge(x =atac_assay_list[[1]] , y= atac_assay_list[[2]] )
+} else if( length(atac_assay_list)==1){
+  mergedAtac <-atac_assay_list[[1]]
+} else{
+  print("Warn!! only 1 or2 sampleset")
+  return(0)
+}
+
+SeuratOBJ[["ATAC"]] <- mergedAtac
+Annotation( SeuratOBJ[["ATAC"]] ) <- annotations
+
+saveRDS( SeuratOBJ ,  paste0(param$outdir , "/IntegratedATAC_OBJ.rds" ))
+export(combined.peaks, con =paste0(param$outdir , "/cobinedPekas.bed" ), format = "BED")
+
+```
+
+```{r peak reduce, include=TRUE}
+SeuratOBJ <- readRDS(paste0(param$outdir , "/IntegratedATAC_OBJ.rds" ))
+DefaultAssay(SeuratOBJ) <-"ATAC"
+
+num_cells <- ncol(SeuratOBJ)
+min_cellsofPeak <- num_cells * 0.05
+peak_selection_flags <- apply( SeuratOBJ@assays$ATAC@counts, 1 , function(x){ return (sum(x>0) > min_cellsofPeak) } )
+reduced_peak <- combined.peaks[peak_selection_flags,]
+export(reduced_peak, con =paste0(param$outdir , "/cobinedPekas_rm_under_5pct_population.bed" ), format = "BED")
+
+```
+
+
+```{r writMM , include=TRUE}
+
+exp <-GetAssayData(SeuratOBJ , layer = "counts" , assay = "RNA")
+atac <- GetAssayData(SeuratOBJ , layer = "counts", assay = "ATAC")
+atac_exp_mat <- rbind(exp ,atac)
+
+# save sparse matrix
+sparse.atac_exp_mat <- Matrix::Matrix(atac_exp_mat , sparse = T )
+head(sparse.atac_exp_mat)
+## Market Exchange Format (MEX) format
+Matrix::writeMM(obj = sparse.atac_exp_mat, file= paste0(param$outdir , "/matrix.mtx" ))
+
+
+# save genes and cells names
+write(x = rownames(exp), file = paste0(param$outdir ,"/EXP_genesname.tsv"))
+write(x = rownames(atac), file = paste0(param$outdir ,"/Peak_regionname.tsv"))
+
+barcode <-  colnames(atac_exp_mat)
+
+if ( is.na(param$sampleName[2])) {
+  barcode <- gsub(param$sampleName[1] ,"" , barcode)
+} else{
+  barcode[ grep(param$sampleName[2], barcode)] <- gsub( "-1$" ,"-2", barcode[ grep(param$sampleName[2], barcode)])
+  barcode <- gsub(param$sampleName[1] ,"" , barcode)
+  barcode <- gsub(param$sampleName[2] ,"" , barcode)
+}
+barcode <- gsub("^_" ,"" , barcode)
+write(x = barcode, file = paste0(param$outdir ,"/barcodes.tsv"))
+
+output.file = paste0( param$outdir,"/metadata_Input_SeuratOBJ.txt" )
+write.table( SeuratOBJ@meta.data , file =output.file , quote = F ,sep ="\t" ,row.names = T )
+# for LINGER
+
+SeuratOBJ$barcode_use <- rownames(SeuratOBJ@meta.data)
+SeuratOBJ$label <- SeuratOBJ@meta.data[,"seurat_clusters"]
+
+LableForLINGER <- SeuratOBJ@meta.data[,c("barcode_use","label")]
+LableForLINGER$barcode_use <-  barcode
+output.file = paste0( param$outdir,"/LableForLINGER.txt" )
+write.table(LableForLINGER , file =output.file , quote = F ,sep ="\t" ,row.names = F )
+
+
+```
+
+## add cycling score
+```{r add cycling score, }
+SeuratOBJ <- readRDS(paste0(param$outdir , "/IntegratedATAC_OBJ.rds" ))
+SeuratOBJ$CellType <-SetCellAnnotation(param,SeuratOBJ,param$ClusterCategory, from_cname ="seurat_clusters")
+DimPlot(SeuratOBJ ,group.by = "CellType" )
+
+CyclePhase_gene_list <-list(
+  G1S.markers = c( "CEP57", "CDCA7L") ,
+  S.markers   = c("ABHD10", "CCDC14", "CDKN2AIP", "NT5DC1", "SVIP", "PTAR1"),
+  G2.markers  = c("ANKRD36C", "YEATS4", "DCTPP1" ),
+  G2M.markers = c("SMC4", "TMPO", "LMNB1", "HINT3"),
+  M.markers   = c("HMG20B", "HMGB3", "HPS4"),
+  G0markers   =c("CDKN1A","CDKN1B", "CDKN1C")
+)
+
+Cycling_gene_list <-list(
+  cycleing   = c("CEP57", "CDCA7L","ABHD10", "CCDC14", "CDKN2AIP", "NT5DC1", "SVIP", "PTAR1","ANKRD36C", "YEATS4", "DCTPP1" ,"SMC4", "TMPO", "LMNB1", "HINT3","HMG20B", "HMGB3", "HPS4"),
+  noncycling = c("CDKN1A","CDKN1B", "CDKN1C")
+)
+
+DefaultAssay(SeuratOBJ) <- "RNA"
+SeuratOBJ <- NormalizeData(SeuratOBJ)
+SeuratOBJ <- AddModuleScore(
+  object = SeuratOBJ,
+  features = Cycling_gene_list,
+  name =  names(Cycling_gene_list) ,
+  ctrl = 100
+)
+
+SeuratOBJ <- AddModuleScore(
+  object = SeuratOBJ,
+  features = CyclePhase_gene_list,
+  name =  names(CyclePhase_gene_list) ,
+  ctrl = 100
+)
+
+
+p<-DimPlot( SeuratOBJ ,group.by = "seurat_clusters",cols = cluster_pallete )
+output.file = paste0( param$outdir,"/umap_allCell.pdf" )
+ggsave( p , file =output.file , height = 5,width = 5 )
+p <-VlnPlot( SeuratOBJ,features=c("S.Score","G2M.Score"),n = 3, group.by ="seurat_clusters" , pt.size = 0) 
+output.file = paste0( param$outdir,"/vinplot_S_G2Mscore_all.pdf" )
+ggsave( p , file =output.file , height = 5,width = 10 )
+
+
+cc_cate <-  paste0(names(Cycling_gene_list) ,c(1:length(Cycling_gene_list)))
+p1<-FeaturePlot(SeuratOBJ , features =  cc_cate , ncol = 3, min.cutoff = 0)
+output.file = paste0( param$outdir,"/umap_CycleScore.pdf" )
+ggsave( p , file =output.file , height = 4,width = 8 )
+p2<-VlnPlot( SeuratOBJ,features=cc_cate,n = 3, group.by ="seurat_clusters" , pt.size = 0) 
+output.file = paste0( param$outdir,"/Vlnplot_CycleScore.pdf" )
+ggsave( p , file =output.file , height = 4,width = 8 )
+
+
+score_mat <- SeuratOBJ@meta.data[, cc_cate]
+score_mat <- score_mat %>% 
+  as.data.frame() %>% 
+  rowwise() %>%
+  mutate(Max_Column = names(.)[which.max(c_across())]) %>%
+  ungroup()
+
+SeuratOBJ$CellCycle <- score_mat$Max_Column 
+p<-DimPlot(SeuratOBJ,group.by = "CellCycle",split.by = "CellCycle")
+output.file = paste0( param$outdir,"/umap_CycleScore_Annotation.pdf" )
+ggsave( p , file =output.file , height = 4,width = 8 )
+
+cycle_cate <- paste0(names(CyclePhase_gene_list) ,c(1:length(CyclePhase_gene_list)))
+
+p<-FeaturePlot(SeuratOBJ , features =  cycle_cate , ncol = 3, min.cutoff = 0)
+output.file = paste0( param$outdir,"/umap_CyclePhaseScore.pdf" )
+ggsave( p , file =output.file , height = 8,width = 16 )
+p<-VlnPlot( SeuratOBJ,features=cycle_cate,n = 3, group.by ="seurat_clusters" , pt.size = 0) 
+output.file = paste0( param$outdir,"/Vlnplot_CyclePhaseScore.pdf" )
+ggsave( p , file =output.file , height = 8,width = 16 )
+
+score_mat <- SeuratOBJ@meta.data[, cycle_cate]
+score_mat <- score_mat %>% 
+  as.data.frame() %>% 
+  rowwise() %>%
+  mutate(Max_Column = names(.)[which.max( c_across())]) %>%
+  ungroup()
+
+SeuratOBJ$CellCycle_Phase <- score_mat$Max_Column 
+p<-DimPlot(SeuratOBJ,group.by = "CellCycle_Phase",split.by = "CellCycle_Phase")
+output.file = paste0( param$outdir,"/umap_CyclePhaseScore_Annotation.pdf" )
+ggsave( p , file =output.file , height = 4,width = 8 )
+
+saveRDS( SeuratOBJ ,  paste0(param$outdir , "/IntegratedATAC_OBJ_addCyclceScore.rds" ))
+
+```
+
+
+

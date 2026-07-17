@@ -1,0 +1,110 @@
+########################
+# PARM
+########################
+
+colerPalet: "/Analysis/work//work/out_20250709_hdWGCNA/def.pallet.rds"
+#conda
+condapath: "/opt/conda/envs/LINGER/bin/python"
+
+# 複数ある場合 mergeかintefrate
+Info:
+  Human:
+    sample:
+      - "/Analysis/work//Cellranger_Result/Human_241125_38yr/"
+    sampleName:
+      - "Human_241125_38yr"
+    ### Cluster Param
+    ClusterCategory:
+      SSCs: [ 0,1,2,3,5,8,9,10]
+      Differentiation: [4,6,7,11] 
+      rm : [12,13,14]
+  Marmoset:
+    sample:
+    - "/Analysis/work//Cellranger_Result/I7704M_1yr8mnth/outs/"
+    - "/Analysis/work//Cellranger_Result/I7436M_2ys8mnth/outs/"
+    sampleName:
+      - "I7704M_1yr8mnth"
+      - "I7436M_2ys8mnth"
+    ClusterCategory:
+      SSCs: [ 1,2,4,5,8 ]
+      Differentiation: [ 0,3,6 ]
+      rm : [ 7,9,10,11,12 ]
+  Combined :
+    ClusterCategory:
+      SSCs: [ 1,3,5,6,7,8]
+      Differentiation: [0,2,4,10] 
+      rm : [9,11,12]
+    SpeciesName:
+      - "human"
+      - "marmoset"
+    sampleName:
+      - "I7704M_1yr8mnth"
+      - "I7436M_2ys8mnth"
+      - "Human_241125_38yr"
+  Prediction:
+    total_day: 42
+    bin_day: 1
+
+
+########################
+# INPUT DIR/FILE
+########################
+
+before_combined: "/Analysis/work//work_sato/result/out_marge_human_marmoset/integration_condition/nfeatures_2000_method_SCT/UMAP_condition/mindist_0.1_nneighbors_30/combined.rds"
+PATTERN: "P5"
+directories:
+  HumanOut : "/Analysis/work//work_kuze/result/251024_Razvani_human/"
+  MatmosetOut : "/Analysis/work//work_kuze/result/251020_Razvani/"
+  outdir: "/Analysis/work//work_kuze/result/260616_CombinedTrajectory_P5/"
+  scriptdir: "/Analysis/work//work_kuze/script/Pseudotime/"
+  MPalet: "/Analysis/work//work_kuze/result/251024_Razvani_human/"
+  GOdata : "//Analysis/work//Ref/MsigDB_GO/"
+# ~/ncchd/work/out_Human_remove45yr/SeuratOBJ_ForescapePlot.rds
+
+files: 
+  Function:
+    dir: "scriptdir"
+    name: "Function_list_combined_pando.r"
+  HumanSeuratOBJ: 
+    dir: "HumanOut"
+    name: "SeuraOBJ_binadd.rds"
+  Human_FitExp:
+    dir: "HumanOut"
+    name: "timebin_fitGeneEXP.rds"
+  Human_GeneGGM:
+    dir: "HumanOut"
+    name: "Network_GGM_NodeDF_subCluster.rds"   
+  Human_SRscore:
+    dir: "HumanOut"
+    name: "sr_score_all_cell.rds"
+  MarmSeuratOBJ: 
+    dir: "MatmosetOut"
+    name: "SeuraOBJ_binadd.rds"
+  Marm_FitExp:
+    dir: "MatmosetOut"
+    name: "timebin_fitGeneEXP.rds"
+  Marm_GeneGGM:
+    dir: "MatmosetOut"
+    name: "Network_GGM_NodeDF_subCluster.rds"
+  Marm_SRscore:
+    dir: "MatmosetOut"
+    name: "sr_score_all_cell_local.rds"   
+  GSdata:
+    dir: "GOdata"
+    name: "hs_C5_gs.rds"
+
+########################
+# OUTPUT DIR/FILE
+########################
+outfiles:
+  OutSeurat: 
+    dir: "outdir"
+    name: "Output.rds" 
+
+outdir_list:
+  preprocess: "preprocess"
+  DEG: "DEG"
+  Pseudotime: "Pseudotime"
+  brdu: "brdu"
+  STATS: "STATS"
+

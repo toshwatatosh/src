@@ -1,0 +1,451 @@
+```{r}
+setwd("/mnt/20250806create/ncchd-watanabe/2025_scMultiome_analysis/")
+human_obj <- readRDS("~/Analysis/work/out_Human_remove45yr/SeuratOBJ_ForescapePlot.rds")
+```
+```{r setup, include=F ,echo =T}
+setwd("/Analysis/work/")
+
+# ライブラリ読み込み先を指定
+.libPaths()
+knitr::opts_chunk$set(echo = TRUE)
+
+#library(monocle3)
+library(Seurat)
+library(SeuratData)
+library(SeuratWrappers)
+library(ggplot2)
+library(patchwork)
+library(magrittr)
+library(dplyr)
+library(tidyverse)
+library(cowplot)
+library(yaml)
+library(DT)
+library(ggplot2)
+library(Polychrome)
+library(plotly)
+library(DoubletFinder)
+
+
+set.seed(1234)
+options(future.globals.maxSize = 5e10)
+
+dir_path <- "/Analysis/work/work_sato/result/out_Human_remove45yr_paper/"
+
+
+
+```
+
+```{r Make color palet , include= FALSE}
+#set.seed(1234)
+palette <- createPalette(20,　seedcolors=  c("#010101", "#ff0000"), M = 1000,prefix="NA")
+names(palette) <- NULL
+# カラーパレットを表示します
+print(palette)
+# カラーパレットを視覚的に確認するためのプロット
+swatch(palette)
+```
+
+
+```{r}
+
+sample <- "/Analysis/Cellranger_Result/Human_241125_38yr/"
+id <- "Human_241125_38yr"
+
+makeSeuratOBJ <-function(sample, id){
+  
+  h5file <- paste0( sample ,"/filtered_feature_bc_matrix.h5" )
+  inputdata.10x <- Read10X_h5(h5file)
+  rna_counts <- inputdata.10x$`Gene Expression`
+  SeuratOBJ <- CreateSeuratObject(counts = rna_counts,
+                                   project = id, 
+                                   min.cells = 0, 
+                                   min.features = 0)
+  #SeuratOBJ[["percent.mt"]] <- PercentageFeatureSet(SeuratOBJ, 
+  #                                                   pattern = "^MT-")
+  SeuratOBJ <- RenameCells(SeuratOBJ,add.cell.id = id)
+  return(SeuratOBJ)
+}
+
+merged_obj <- makeSeuratOBJ(sample, id)
+
+
+df <- FetchData(merged_obj, vars = c("nFeature_RNA", "nCount_RNA", "orig.ident"))
+p1 <- ggplot(df, aes(x = orig.ident, y = nFeature_RNA)) +
+  geom_violin(fill = "tomato", color = "black") +
+  scale_y_log10() +
+  labs(x = "Identity", y = "nFeature_RNA") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p2 <- ggplot(df, aes(x = orig.ident, y = nCount_RNA)) +
+  geom_violin(fill = "tomato", color = "black") +
+  scale_y_log10() +
+  labs(x = "Identity", y = "nCount_RNA") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p <- p1 + p2  # patchworkで横並びに表示
+#save Plot
+output.file = paste0( dir_path,"/QCVlnPlot_beforFilter.pdf" )
+ggsave( p , file =output.file , height = 6,width = 6 )
+
+
+filteredCell <- rownames(merged_obj@meta.data %>% filter( nFeature_RNA > 2500 & nFeature_RNA < 10000 ))
+merged_obj <- subset(merged_obj , cells = filteredCell)
+
+df <- FetchData(merged_obj, vars = c("nFeature_RNA", "nCount_RNA", "orig.ident"))
+
+p1 <- ggplot(df, aes(x = orig.ident, y = nFeature_RNA)) +
+  geom_violin(fill = "tomato", color = "black") +
+  scale_y_log10() +
+  labs(x = "Identity", y = "nFeature_RNA") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p2 <- ggplot(df, aes(x = orig.ident, y = nCount_RNA)) +
+  geom_violin(fill = "tomato", color = "black") +
+  scale_y_log10() +
+  labs(x = "Identity", y = "nCount_RNA") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p <- p1 + p2  # patchworkで横並びに表示
+#save Plot
+output.file = paste0( dir_path,"/QCVlnPlot_afterFilter.pdf" )
+ggsave( p , file =output.file , height = 6,width = 6 )
+
+
+
+```
+
+
+
+
+```{r}
+merged_obj <- NormalizeData(merged_obj)
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+merged_obj <- FindVariableFeatures(merged_obj, 
+                                     selection.method = "vst", 
+                                     nfeatures = 4000 )
+all.genes <- rownames(merged_obj)
+merged_obj <- ScaleData(merged_obj, features = all.genes)
+  
+fature_gene = VariableFeatures(merged_obj)
+fature_gene = fature_gene[! fature_gene %in% unlist(cc.genes)]
+VariableFeatures(merged_obj) = fature_gene
+
+merged_obj <- RunPCA(merged_obj , features = fature_gene)
+merged_obj <- FindNeighbors(merged_obj, dims = 1:30 ,reduction ="pca")
+merged_obj <- FindClusters(merged_obj, resolution = 0.9   )
+merged_obj <- RunUMAP(merged_obj, dims =  1:30 , reduction ="pca", n.components = 2)
+
+merged_obj <- CellCycleScoring(merged_obj,
+                               s.features = s.genes,
+                               g2m.features = g2m.genes, 
+                               set.ident = TRUE)
+Idents(merged_obj) <-"seurat_clusters"
+DefaultAssay(merged_obj) <- "RNA"
+
+num_cluster = length(unique(merged_obj$seurat_clusters))
+cluster_pallete <- palette[1:num_cluster ]
+names(cluster_pallete) <- c(0:(num_cluster-1) )
+
+p <- DimPlot(merged_obj, cols=cluster_pallete, label = T)
+output.file = paste0( dir_path,"/dimplot_seurat_cluster.pdf" )
+ggsave( p , file =output.file , height = 6,width = 6 )
+
+
+
+original_RNA <- merged_obj[["RNA"]]
+merged_obj[["RNA"]] <- JoinLayers(original_RNA)
+sweep.res.list <- paramSweep(merged_obj, PCs = 1:10, sct = FALSE)
+sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
+pK <- find.pK(sweep.stats)
+print(pK)  # 推奨される pK 値
+ggplot(pK, aes(pK, BCmetric, group = 1)) + geom_point() + geom_line()
+best_pK <- pK$pK[which.max(pK$BCmetric)]
+best_pK <- as.numeric(as.character(best_pK))
+
+
+
+annotations <- merged_obj@meta.data$seurat_clusters
+homotypic.prop <- modelHomotypic(annotations)
+nExp_poi <- round(0.01*nrow(merged_obj@meta.data))
+nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+merged_obj <- doubletFinder(merged_obj, PCs = 1:20, pN = 0.25, pK = best_pK, nExp = nExp_poi.adj, reuse.pANN = NULL, sct = FALSE)
+
+
+p <- DimPlot(merged_obj, reduction = "umap", group.by = "DF.classifications_0.25_0.005_80", 
+        cols = c("gray", "red"), order = c("Doublet", "Singlet"),pt.size = 0.01)
+
+output.file = paste0( dir_path,"/UMAP_doublet.pdf" )
+ggsave( p , file =output.file , height = 6,width = 6 )
+
+
+
+# Seuratオブジェクトから必要なデータを抽出
+df <- FetchData(merged_obj, vars = c("pANN_0.25_0.005_80", "seurat_clusters"))
+
+p <- ggplot(df, aes(x = seurat_clusters, y = pANN_0.25_0.005_134)) +
+    geom_violin(
+        fill = "tomato",
+        color = "black",
+        trim = TRUE,          # Seurat と同じく端を切らない
+        bw = 0.05          # スムージング幅を調整（ふくらみを出す）
+    ) +
+    labs(x = "Cluster", y = "pANN (log10)", title = "pANN") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+output.file = paste0( dir_path,"/pANN_VlnPlot.pdf" )
+ggsave( p , file =output.file , height = 6,width = 6 )
+
+
+```
+
+
+```{r}
+
+merged_obj <- subset(merged_obj, subset = seurat_clusters != "12")
+
+merged_obj <- NormalizeData(merged_obj)
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+merged_obj <- FindVariableFeatures(merged_obj, 
+                                     selection.method = "vst", 
+                                     nfeatures = 4000 )
+all.genes <- rownames(merged_obj)
+merged_obj <- ScaleData(merged_obj, features = all.genes)
+  
+fature_gene = VariableFeatures(merged_obj)
+fature_gene = fature_gene[! fature_gene %in% unlist(cc.genes)]
+VariableFeatures(merged_obj) = fature_gene
+
+merged_obj <- RunPCA(merged_obj , features = fature_gene)
+merged_obj <- FindNeighbors(merged_obj, dims = 1:30 ,reduction ="pca")
+merged_obj <- FindClusters(merged_obj, resolution = 0.9   )
+merged_obj <- RunUMAP(merged_obj, dims =  1:30 , reduction ="pca", n.components = 2)
+
+merged_obj <- CellCycleScoring(merged_obj,
+                               s.features = s.genes,
+                               g2m.features = g2m.genes, 
+                               set.ident = TRUE)
+Idents(merged_obj) <-"seurat_clusters"
+DefaultAssay(merged_obj) <- "RNA"
+
+p <- DimPlot(merged_obj, cols=cluster_pallete, label = T)
+output.file = paste0( dir_path,"/dimplot_seurat_cluster_rm12.pdf" )
+ggsave( p , file =output.file , height = 6,width = 6 )
+```
+
+
+
+
+##################################
+# macaque
+##################################
+
+```{r}
+dir_path <- "/Analysis/work/work_sato/result/out_Macaque_paper"
+
+sample1 <- "/Analysis/work/Cellranger_Result/Macaque_06_19_v2/"
+sample2 <- "/Analysis/work/Cellranger_Result/Macaque_12_27_v2/"
+id1 <- "Macaque_06_19"
+id2 <- "Macaque_12_27"
+
+
+sample1_OBJ <- makeSeuratOBJ(sample1, id1)
+sample2_OBJ <- makeSeuratOBJ(sample2, id2)
+merged_obj <- merge(x =sample1_OBJ, y =sample2_OBJ)
+merged_obj$orig.ident <- factor(merged_obj$orig.ident, levels= c("Macaque_06_19","Macaque_12_27"))
+
+df <- FetchData(merged_obj, vars = c("nFeature_RNA", "nCount_RNA", "orig.ident"))
+p1 <- ggplot(df, aes(x = orig.ident, y = nFeature_RNA)) +
+  geom_violin(fill = "tomato", color = "black") +
+  scale_y_log10() +
+  labs(x = "Sample", y = "nFeature_RNA (log10)") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p2 <- ggplot(df, aes(x = orig.ident, y = nCount_RNA)) +
+  geom_violin(fill = "tomato", color = "black") +
+  scale_y_log10() +
+  labs(x = "Sample", y = "nCount_RNA (log10)") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p1 + p2
+
+p <- p1 + p2  # patchworkで横並びに表示
+#save Plot
+output.file = paste0( dir_path,"/QCVlnPlot_beforFilter.pdf" )
+ggsave( p , file =output.file , height = 6,width = 10 )
+
+filteredCell <- rownames(merged_obj@meta.data %>% filter(nFeature_RNA > 2500 & nFeature_RNA < 10000))
+merged_obj <- subset(merged_obj , cells = filteredCell)
+
+df <- FetchData(merged_obj, vars = c("nFeature_RNA", "nCount_RNA", "orig.ident"))
+p1 <- ggplot(df, aes(x = orig.ident, y = nFeature_RNA)) +
+  geom_violin(fill = "tomato", color = "black") +
+  scale_y_log10() +
+  labs(x = "Sample", y = "nFeature_RNA (log10)") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p2 <- ggplot(df, aes(x = orig.ident, y = nCount_RNA)) +
+  geom_violin(fill = "tomato", color = "black") +
+  scale_y_log10() +
+  labs(x = "Sample", y = "nCount_RNA (log10)") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p1 + p2
+
+p <- p1 + p2  # patchworkで横並びに表示
+#save Plot
+output.file = paste0( dir_path,"/QCVlnPlot_afterFilter.pdf" )
+ggsave( p , file =output.file , height = 6,width = 10 )
+
+
+```
+
+
+
+
+```{r}
+merged_obj <- NormalizeData(merged_obj)
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+merged_obj <- FindVariableFeatures(merged_obj, 
+                                     selection.method = "vst", 
+                                     nfeatures = 4000 )
+all.genes <- rownames(merged_obj)
+merged_obj <- ScaleData(merged_obj, features = all.genes)
+  
+fature_gene = VariableFeatures(merged_obj)
+fature_gene =fature_gene[! fature_gene %in% unlist(cc.genes)]
+VariableFeatures(merged_obj) = fature_gene
+
+length(fature_gene)
+
+merged_obj <- RunPCA(merged_obj , features = fature_gene)
+
+merged_obj <- IntegrateLayers(object = merged_obj,
+                             method = RPCAIntegration,
+                             features = fature_gene,
+                             orig.reduction = "pca",
+                             new.reduction = "integrated.rpca",
+                             verbose = FALSE)
+
+merged_obj <- FindNeighbors(merged_obj, dims =  1:40 ,reduction ="integrated.rpca")
+merged_obj <- FindClusters(merged_obj, resolution = 0.5)
+merged_obj <- RunUMAP(merged_obj, dims =  1:40 , reduction ="integrated.rpca")
+
+num_cluster = length(unique(merged_obj$seurat_clusters))
+cluster_pallete <- palette[1:num_cluster ]
+names(cluster_pallete) <- c(0:(num_cluster-1) )
+
+p <- DimPlot(merged_obj, cols=cluster_pallete, label = T)
+output.file = paste0( dir_path,"/dimplot_seurat_cluster.pdf" )
+ggsave( p , file =output.file , height = 6,width = 6 )
+
+
+
+original_RNA <- merged_obj[["RNA"]]
+merged_obj[["RNA"]] <- JoinLayers(original_RNA)
+sweep.res.list <- paramSweep(merged_obj, PCs = 1:10, sct = FALSE)
+sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
+pK <- find.pK(sweep.stats)
+print(pK)  # 推奨される pK 値
+ggplot(pK, aes(pK, BCmetric, group = 1)) + geom_point() + geom_line()
+best_pK <- pK$pK[which.max(pK$BCmetric)]
+best_pK <- as.numeric(as.character(best_pK))
+
+annotations <- merged_obj@meta.data$seurat_clusters
+homotypic.prop <- modelHomotypic(annotations)
+nExp_poi <- round(0.01*nrow(merged_obj@meta.data))
+nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+merged_obj <- doubletFinder(merged_obj, PCs = 1:20, pN = 0.25, pK = best_pK, nExp = nExp_poi.adj, reuse.pANN = NULL, sct = FALSE)
+
+p <- DimPlot(merged_obj, reduction = "umap", group.by = "DF.classifications_0.25_0.005_134", 
+        cols = c("gray", "red"), order = c("Doublet", "Singlet"),pt.size = 0.01)
+
+output.file = paste0( dir_path,"/UMAP_doublet.pdf" )
+ggsave( p , file =output.file , height = 6,width = 6 )
+
+
+# Seuratオブジェクトから必要なデータを抽出
+df <- FetchData(merged_obj, vars = c("pANN_0.25_0.005_134", "seurat_clusters"))
+
+p <- ggplot(df, aes(x = seurat_clusters, y = pANN_0.25_0.005_134)) +
+    geom_violin(
+        fill = "tomato",
+        color = "black",
+        trim = TRUE,          # Seurat と同じく端を切らない
+        bw = 0.05          # スムージング幅を調整（ふくらみを出す）
+    ) +
+    labs(x = "Cluster", y = "pANN (log10)", title = "pANN") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+output.file = paste0( dir_path,"/pANN_VlnPlot.pdf" )
+ggsave( p , file =output.file , height = 6,width = 6 )
+
+```
+
+
+```{r}
+# ① クラスタ6を除外
+
+obj2 <- subset(merged_obj, subset = seurat_clusters != "6")
+#obj2 <- subset(merged_obj, subset = DF.classifications_0.25_0.005_134 == "Singlet")
+
+
+# ③ 正規化
+obj2 <- NormalizeData(obj2)
+
+# ④ HVG
+obj2 <- FindVariableFeatures(obj2, selection.method = "vst", nfeatures = 4000)
+
+# ⑤ スケーリング
+all.genes <- rownames(obj2)
+merged_obj <- ScaleData(obj2, features = all.genes)
+obj2 <- ScaleData(obj2)
+
+fature_gene = VariableFeatures(obj2)
+fature_gene =fature_gene[! fature_gene %in% unlist(cc.genes)]
+VariableFeatures(obj2) = fature_gene
+
+# ⑥ PCA
+obj2 <- RunPCA(obj2, features = fature_gene)
+
+# # ⑦ 統合（RPCA）
+# obj2 <- IntegrateLayers(
+#   object = obj2,
+#   method = RPCAIntegration,
+#   features = VariableFeatures(obj2),
+#   orig.reduction = "pca",
+#   new.reduction = "integrated.rpca"
+# )
+
+# ⑧ 近傍 & クラスタリング
+obj2 <- FindNeighbors(obj2, dims = 1:40, reduction = "integrated.rpca")
+obj2 <- FindClusters(obj2, resolution = 0.5)
+
+# ⑨ UMAP
+obj2 <- RunUMAP(obj2, dims = 1:40, reduction = "integrated.rpca")
+
+
+num_cluster = length(unique(obj2$seurat_clusters))
+cluster_pallete <- palette[1:num_cluster ]
+names(cluster_pallete) <- c(0:(num_cluster-1) )
+
+
+p <- DimPlot(obj2, reduction = "umap" ,cols=cluster_pallete, label = T)
+
+```

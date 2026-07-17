@@ -1,0 +1,678 @@
+---
+title: "Co-expression Network Analysis"
+subtitle: "Marmoset"
+doc_type: 作業報告書
+author: 株式会社ダイナコム 久世、佐藤、江端
+date: "`r format(Sys.time(), '%Y年%m月%d日')`"
+output:
+    html_document:
+        toc: true
+        toc_depth: 4
+        toc_float:    # 目次は固定にしない
+          collapsed: false
+        number_section: true
+        pandoc_args: ["--from", "markdown+autolink_bare_uris+tex_math_single_backslash-implicit_figures"]
+        self_contained: False
+---
+
+
+<!-- 画像をクリックすると拡大表示するjs -->
+```{js echo=FALSE}
+$(function(){
+  $("img:not(.lb-image)").wrap(function() {
+    return "<a href='" + $(this).attr("src") + "' data-lightbox='" + $(this).attr("scr") + "'></a>";
+  });
+});
+```
+
+## Load Library
+
+```{r setup, include=F ,echo =T}
+setwd("/Analysis/work/")
+
+# ライブラリ読み込み先を指定
+.libPaths()
+knitr::opts_chunk$set(echo = TRUE)
+
+#library(monocle3)
+library(Seurat)
+library(SeuratData)
+library(SeuratDisk)
+library(zellkonverter)
+library(data.table)
+library(SeuratWrappers)
+library(ggplot2)
+library(patchwork)
+library(magrittr)
+library(dplyr)
+library(tidyverse)
+library(cowplot)
+library(yaml)
+library(DT)
+library(ggplot2)
+library(Polychrome)
+# co-expression network analysis packages:
+library(WGCNA)
+library(hdWGCNA)
+library(UCell)
+library(igraph)
+#library(enrichR)
+library(clusterProfiler)
+library(GeneOverlap)
+library(heatmap3)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(biomaRt)
+library(readr)
+library(SeuratObject)
+library(ComplexHeatmap)
+library(patchwork)
+library(scales)
+library(GOSemSim)
+library(Matrix)
+
+
+
+
+enableWGCNAThreads(nThreads = 8)
+
+set.seed(1234)
+options(future.globals.maxSize = 1e12)
+```
+
+```{r Make color palet , include= FALSE}
+#set.seed(1234)
+palette <- createPalette(20,　seedcolors=  c("#010101", "#ff0000"), M = 1000,prefix="NA")
+names(palette) <- NULL
+# カラーパレットを表示します
+print(palette)
+# カラーパレットを視覚的に確認するためのプロット
+swatch(palette)
+```
+
+## 関数定義
+```{r }
+## ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+## UMAP,Feature Plot,Vln Plotを描画する関数
+## ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+plot_graph <- function(seurat_obj, dir_path) {
+  
+  
+  p1 <- DimPlot(seurat_obj,group.by = "cluster_id", label = TRUE, pt.size = 0.5, label.size = 7)
+  output.file <- file.path(dir_path, "integrated_UMAP.pdf")
+  ggsave( p1 , file =output.file , height = 10,width = 12 )
+  
+  
+  p2 <- DimPlot(seurat_obj, group.by = "cluster_id", split.by = "species", label = TRUE, pt.size = 0.5, ncol = 1)
+  output.file <- file.path(dir_path, "species-cluster_UMAP.pdf")
+  ggsave( p2 , file =output.file , height = 10,width = 6 )
+  
+  
+  # 集計：クラスタごとの種別細胞数
+  cluster_species_counts <- seurat_obj@meta.data %>%
+    group_by(seurat_clusters, species) %>%
+    summarise(count = n()) %>%
+    ungroup()
+  
+  # 描画：クラスタごとの種構成を棒グラフで表示
+  p3 <- ggplot(cluster_species_counts, aes(x = factor(seurat_clusters), y = count, fill = species)) +
+    geom_bar(stat = "identity", position = "stack") +
+    labs(x = "Cluster", y = "Cell Count", fill = "Species",
+         title = "Cluster-wise Cell Composition by Species") +
+    theme_minimal()
+  
+  output.file <- file.path(dir_path, "cell_count.pdf")
+  ggsave( p3 , file =output.file , height = 5,width = 8 )
+  
+  
+  # ① 各種の総細胞数を取得
+  species_totals <- table(seurat_obj$species)
+  
+  # ② クラスタ × 種別の細胞数を集計
+  cluster_species_counts <- seurat_obj@meta.data %>%
+    group_by(seurat_clusters, species) %>%
+    summarise(count = n()) %>%
+    ungroup()
+  
+  # ③ 種内比率で正規化
+  cluster_species_counts <- cluster_species_counts %>%
+    mutate(species_total = species_totals[species],
+           normalized = count / species_total)
+  
+  # ④ 描画：種内比率ベースの積み上げ棒グラフ
+  p4 <- ggplot(cluster_species_counts, aes(x = factor(seurat_clusters), y = normalized, fill = species)) +
+    geom_bar(stat = "identity", position = "stack") +
+    labs(x = "Cluster",
+         y = "Normalized Proportion (per species)",
+         fill = "Species",
+         title = "Cluster Composition Normalized by Species Total") +
+    theme_minimal()
+  
+  output.file <- file.path(dir_path, "Normalized_cell_count.pdf")
+  ggsave( p4 , file =output.file , height = 5,width = 8 )
+  
+  
+  
+  p5 <- DimPlot(seurat_obj, group.by = "species", label = TRUE, pt.size = 0.5)
+  output.file <- file.path(dir_path, "species-integrate_UMAP.pdf")
+  ggsave( p5 , file =output.file , height = 10,width = 12 )
+  
+  p6 <- DimPlot(seurat_obj, group.by = "species", split.by = "species", label = FALSE, pt.size = 0.5, ncol = 1)
+  output.file <- file.path(dir_path, "species-split_UMAP.pdf")
+  ggsave( p6 , file =output.file , height = 10,width = 6 )
+  
+  DefaultAssay(seurat_obj) <- "RNA"
+  seurat_obj <- NormalizeData(seurat_obj)
+  
+  
+  p7 <- FeaturePlot(seurat_obj,
+                    features = c("DPPA3", "DPPA4", "GFRA1", "SALL4"),
+                    split.by = "species",
+                    pt.size = 0.2
+                    ) & 
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_blank()
+    )
+
+  output.file <- file.path(dir_path, "feature_plot_group1__1.pdf")
+  ggsave( p7 , file =output.file , height = 10,width = 8 )
+  
+  
+  vln_list <- map(c("DPPA3", "DPPA4", "GFRA1", "SALL4"), ~ VlnPlot(
+    seurat_obj,
+    features = .x,
+    group.by = "seurat_clusters",
+    split.by = "species",
+    pt.size = 0
+  ))
+  
+  output.file <- file.path(dir_path, "vln_plot_group1__1.pdf")
+  
+  p7_1 <- wrap_plots(vln_list, ncol = 1)
+  ggsave(p7_1, file = output.file, height = 10, width = 8)
+
+
+  
+  
+  
+  p8 <- FeaturePlot(seurat_obj,
+                    features = c("ETV5", "ID4" ,"HES1"),
+                    split.by = "species",
+                    pt.size = 0.2
+                    ) & 
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_blank()
+    )
+
+  output.file <- file.path(dir_path, "feature_plot_group1__2.pdf")
+  ggsave( p8 , file =output.file , height = 7.5,width = 8 )
+  
+  vln_list <- map(c("ETV5", "ID4" ,"HES1"), ~ VlnPlot(
+    seurat_obj,
+    features = .x,
+    group.by = "seurat_clusters",
+    split.by = "species",
+    pt.size = 0
+  ))
+  
+  output.file <- file.path(dir_path, "vln_plot_group1__2.pdf")
+  
+  p8_1 <- wrap_plots(vln_list, ncol = 1)
+  ggsave(p8_1, file = output.file, height = 7.5, width = 8)
+  
+  
+
+  
+  
+  
+  p9 <- FeaturePlot(seurat_obj,
+                    features = c("ID4", "HES1"),
+                    split.by = "species",
+                    pt.size = 0.2
+                    ) & 
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_blank()
+    )
+
+  output.file <- file.path(dir_path, "feature_plot_group1_0A.pdf")
+  ggsave( p9 , file =output.file , height = 5,width = 8 )
+  
+  vln_list <- map(c("ID4", "HES1"), ~ VlnPlot(
+    seurat_obj,
+    features = .x,
+    group.by = "seurat_clusters",
+    split.by = "species",
+    pt.size = 0
+  ))
+  
+  output.file <- file.path(dir_path, "vln_plot_group1_0A.pdf")
+  
+  p9_1 <- wrap_plots(vln_list, ncol = 1)
+  ggsave(p9_1, file = output.file, height = 5, width = 8)
+  
+  
+  p10 <- FeaturePlot(seurat_obj,
+                    features = c("ENO3", "A2M", "FGFR3"),
+                    split.by = "species",
+                    pt.size = 0.2
+                    ) & 
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_blank()
+    )
+
+  output.file <- file.path(dir_path, "feature_plot_group0A.pdf")
+  ggsave( p10 , file =output.file , height = 7.5,width = 8 ) 
+  
+  vln_list <- map(c("ENO3", "A2M", "FGFR3"), ~ VlnPlot(
+    seurat_obj,
+    features = .x,
+    group.by = "seurat_clusters",
+    split.by = "species",
+    pt.size = 0
+  ))
+  
+  output.file <- file.path(dir_path, "vln_plot_group0A.pdf")
+  
+  p10_1 <- wrap_plots(vln_list, ncol = 1)
+  ggsave(p10_1, file = output.file, height = 7.5, width = 8)
+  
+  
+  
+  p11 <- FeaturePlot(seurat_obj,
+                    features = c("NANOS2", "DND1", "UTF1", "SPOCD1"),
+                    split.by = "species",
+                    pt.size = 0.2
+                    ) & 
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_blank()
+    )
+
+  output.file <- file.path(dir_path, "feature_plot_group0B.pdf")
+  ggsave( p11 , file =output.file , height = 10,width = 8 )  
+  
+  vln_list <- map(c("NANOS2", "DND1", "UTF1", "SPOCD1"), ~ VlnPlot(
+    seurat_obj,
+    features = .x,
+    group.by = "seurat_clusters",
+    split.by = "species",
+    pt.size = 0
+  ))
+  
+  output.file <- file.path(dir_path, "vln_plot_group0B.pdf")
+  
+  p11_1 <- wrap_plots(vln_list, ncol = 1)
+  ggsave(p11_1, file = output.file, height = 10, width = 8)
+  
+
+  
+  p12 <- FeaturePlot(seurat_obj,
+                    features = c("EGR4", "PIWIL4", "TSPAN33"),
+                    split.by = "species",
+                    pt.size = 0.2
+                    ) & 
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_blank()
+    )
+
+  output.file <- file.path(dir_path, "feature_plot_group0.pdf")
+  ggsave( p12 , file =output.file , height = 7.5,width = 8 )  
+  
+  vln_list <- map(c("EGR4", "PIWIL4", "TSPAN33"), ~ VlnPlot(
+    seurat_obj,
+    features = .x,
+    group.by = "seurat_clusters",
+    split.by = "species",
+    pt.size = 0
+  ))
+  
+  output.file <- file.path(dir_path, "vln_plot_group0.pdf")
+  
+  p12_1 <- wrap_plots(vln_list, ncol = 1)
+  ggsave(p12_1, file = output.file, height = 7.5, width = 8)
+  
+  
+  
+  p13 <- FeaturePlot(seurat_obj,
+                    features = c("KIT", "ZEB2", "NANOS3"),
+                    split.by = "species",
+                    pt.size = 0.2
+                    ) & 
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_blank()
+    )
+
+  output.file <- file.path(dir_path, "feature_plot_differentiation.pdf")
+  ggsave( p13 , file =output.file , height = 7.5,width = 8 ) 
+  
+  
+  vln_list <- map(c("KIT", "ZEB2", "NANOS3"), ~ VlnPlot(
+    seurat_obj,
+    features = .x,
+    group.by = "seurat_clusters",
+    split.by = "species",
+    pt.size = 0
+  ))
+  
+  output.file <- file.path(dir_path, "vln_plot_differentiation.pdf")
+  
+  p13_1 <- wrap_plots(vln_list, ncol = 1)
+  ggsave(p13_1, file = output.file, height = 7.5, width = 8)
+  
+  
+  
+  p<- FeaturePlot(seurat_obj, features = c("S.Score","G2M.Score") , ncol=2 , pt.size = 0.01 ,cols = c("blue","grey", "red") ) 
+  output.file <- file.path(dir_path, "S_G2M_score.pdf")
+
+  ggsave( p , file =output.file , height = 5,width = 11 )
+  
+  plot_gene <- c("MKI67","CDKN1B")
+  p<- FeaturePlot(seurat_obj, features =plot_gene , ncol=2 , 
+                  pt.size = 0.01 ,cols = c("grey", "red") , slot = "data" ,max.cutoff = 1) 
+  p
+  output.file = paste0( dir_path, "/FeaturePlot_CellCycle_Gene.pdf" )
+  ggsave( p , file =output.file , height = 5,width = 11 )
+  
+  
+  
+  
+  
+  
+}
+
+```
+
+
+# ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+# raed expression matrix
+# ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+
+```{r ReadYAML 1, include=FALSE, echo =F}
+dir_path <- "/Analysis/work/out_marge_human_marmoset/sct_integration/"
+```
+
+```{r ReadYAML, include=TRUE}
+
+# ディレクトリの存在を確認し、存在しない場合は作成
+if (!dir.exists(dir_path)) {
+  dir.create(dir_path, recursive = TRUE)
+  message("ディレクトリを作成しました: ", dir_path)
+} else {
+  message("output ディレクトリは既に存在します: ", dir_path)
+}
+
+```
+
+```{r preprocess , include=TRUE ,fig.width=12, fig.height=6}
+
+human_obj <- readRDS("/Analysis/work/out_Human_remove45yr/SeuratOBJ_ForescapePlot.rds")
+marmoset_obj <- readRDS("/Analysis/work/forPlot_data/SeuratOBJ_Forescape_Marmoset.rds")
+
+
+
+species_list <- list(human = human_obj, marmoset = marmoset_obj)
+seurat_list <- list()
+
+for (species in names(species_list)) {
+  obj <- species_list[[species]]
+  
+  # 生データ抽出
+  counts <- GetAssayData(obj, assay = "RNA", slot = "counts")
+  meta <- obj@meta.data
+  meta$species <- species
+  
+  # 再構築（必要なら）
+  seu <- CreateSeuratObject(counts = counts, meta.data = meta)
+  seu$species <- species
+  
+  seurat_list[[species]] <- seu
+}
+
+# 統合（細胞名に接頭辞を付与）
+combined <- merge(seurat_list[[1]], y = seurat_list[-1], add.cell.ids = names(seurat_list))
+
+# ① 種別細胞数を集計
+species_counts <- combined_filtered@meta.data %>%
+  count(species)
+
+# ② 描画：棒グラフ
+ggplot(species_counts, aes(x = species, y = n, fill = species)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Species",
+       y = "Cell Count",
+       title = "Total Cell Count per Species") +
+  theme_minimal()
+
+
+
+
+
+```
+
+
+```{r}
+
+# 条件の組み合わせ
+nfeatures_list <- c(2000, 3000, 5000)
+methods <- c("SCT", "LogNormalize")
+
+
+# 解析ループ
+for (nf in nfeatures_list) {
+  for (method in methods) {
+    
+    # 出力ディレクトリの構築
+    dir_path <- paste0(
+      "/Analysis/work/work_sato/result/out_marge_human_marmoset/",
+      "integration_condition/nfeatures_", nf, "_method_", method
+    )
+    
+    # ディレクトリ作成
+    if (!dir.exists(dir_path)) {
+      dir.create(dir_path, recursive = TRUE)
+      message("ディレクトリを作成しました: ", dir_path)
+    } else {
+      message("output ディレクトリは既に存在します: ", dir_path)
+    }
+    
+    # 正規化処理
+    if (method == "SCT") {
+      seurat_list_norm <- lapply(seurat_list, SCTransform, verbose = FALSE)
+      seurat_list_norm <- PrepSCTIntegration(
+        object.list = seurat_list_norm,
+        anchor.features = SelectIntegrationFeatures(object.list = seurat_list_norm, nfeatures = nf)
+      )
+    } else {
+      seurat_list_norm <- lapply(seurat_list, NormalizeData, verbose = FALSE)
+    }
+    
+    # アンカー抽出
+    features <- SelectIntegrationFeatures(object.list = seurat_list_norm, nfeatures = nf)
+    anchors <- FindIntegrationAnchors(
+      object.list = seurat_list_norm,
+      normalization.method = method,
+      anchor.features = features,
+      dims = 1:30
+    )
+    
+    # 統合
+    combined <- IntegrateData(anchorset = anchors, normalization.method = method)
+    DefaultAssay(combined) <- "integrated"
+    
+    # 下流解析
+    combined <- ScaleData(combined)
+    combined <- RunPCA(combined)
+    combined <- FindNeighbors(combined, dims = 1:30)
+    combined <- FindClusters(combined, resolution = 0.5)
+    combined <- RunUMAP(combined, dims = 1:30)
+    
+    # メタ情報追加
+    combined$species_cluster <- paste0(combined$species, "-", combined$seurat_clusters)
+    combined$cluster_id <- combined$seurat_clusters
+    
+    # 可視化と保存
+    plot_graph(combined, dir_path)
+    saveRDS(combined, file = file.path(dir_path, "combined.rds"))
+  }
+}
+
+```
+
+
+```{r}
+dir_path <- "/Analysis/work/work_sato/result/out_marge_human_marmoset/integration_condition/nfeatures_2000_method_SCT/combined.rds"
+
+
+combined <- readRDS(dir_path)
+
+params <- expand.grid(
+  min.dist = c(0.01, 0.1, 0.3),
+  n.neighbors = c(15, 30, 50)
+)
+
+params <- expand.grid(
+  min.dist = c(0.1),
+  n.neighbors = c(30)
+)
+
+for (i in 1:nrow(params)) {
+  # 出力ディレクトリの構築
+  save_path <- paste0(
+    "/Analysis/work/work_sato/result/out_marge_human_marmoset/",
+    "integration_condition/nfeatures_2000_method_SCT/UMAP_condition/mindist_", params$min.dist[i], "_nneighbors_", params$n.neighbors[i]
+  )
+  
+   # ディレクトリ作成
+  if (!dir.exists(save_path)) {
+    dir.create(save_path, recursive = TRUE)
+    message("ディレクトリを作成しました: ", save_path)
+  } else {
+    message("output ディレクトリは既に存在します: ", save_path)
+  }
+  
+  
+  combined <- RunUMAP(
+    combined,
+    reduction = "pca",
+    dims = 1:30,  # 固定
+    min.dist = params$min.dist[i],
+    n.neighbors = params$n.neighbors[i]
+  )
+  # 描画・保存処理
+  plot_graph(combined, save_path)
+  #saveRDS(combined, file = file.path(save_path, "combined.rds"))
+}
+```
+
+```{r}
+dir_path <- "/Analysis/work/work_sato/result/out_marge_human_marmoset/integration_condition/nfeatures_2000_method_SCT/combined.rds"
+
+combined <- readRDS(dir_path)
+
+# 対象クラスタ番号
+target_clusters <- c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+
+# 抽出（Seuratオブジェクトの "seurat_clusters" メタデータを参照）
+seurat_obj <- subset(combined, idents = target_clusters)
+
+
+
+# 集計：クラスタごとの種別細胞数
+cluster_species_counts <- seurat_obj@meta.data %>%
+  group_by(seurat_clusters, species) %>%
+  summarise(count = n()) %>%
+  ungroup()
+  
+# 描画：クラスタごとの種構成を棒グラフで表示
+p3 <- ggplot(cluster_species_counts, aes(x = factor(seurat_clusters), y = count, fill = species)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(x = "Cluster", y = "Cell Count", fill = "Species",
+       title = "Cluster-wise Cell Composition by Species") +
+  theme_minimal()
+
+output.file <- file.path(dir_path, "cell_count.pdf")
+ggsave( p3 , file =output.file , height = 5,width = 8 )
+
+
+# ① 各種の総細胞数を取得
+species_totals <- table(seurat_obj$species)
+
+# ② クラスタ × 種別の細胞数を集計
+cluster_species_counts <- seurat_obj@meta.data %>%
+  group_by(seurat_clusters, species) %>%
+  summarise(count = n()) %>%
+  ungroup()
+
+# ③ 種内比率で正規化
+cluster_species_counts <- cluster_species_counts %>%
+  mutate(species_total = species_totals[species],
+         normalized = count / species_total)
+
+# ④ 描画：種内比率ベースの積み上げ棒グラフ
+p4 <- ggplot(cluster_species_counts, aes(x = factor(seurat_clusters), y = normalized, fill = species)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(x = "Cluster",
+       y = "Normalized Proportion (per species)",
+       fill = "Species",
+       title = "Cluster Composition Normalized by Species Total") +
+  theme_minimal()
+
+output.file <- file.path(dir_path, "Normalized_cell_count.pdf")
+ggsave( p4 , file =output.file , height = 5,width = 8 )
+```
+
+
+# クオリティチェック
+
+```{r}
+
+dir_path <- "/Analysis/work/work_sato/result/out_marge_human_marmoset/integration_condition/nfeatures_2000_method_SCT/UMAP_condition/mindist_0.1_nneighbors_30"
+
+
+combined <- readRDS(file.path(dir_path, "combined.rds"))
+
+output_path <- file.path(dir_path, "quality_UMAP.pdf")
+p <- FeaturePlot(combined, features = "nFeature_RNA", cols = c("lightgrey", "blue"), split.by = "species")
+ggsave( p , file =output_path , height = 5,width = 10 )
+
+
+
+output_path <- file.path(dir_path, "quality_vln_species.pdf")
+p2 <- VlnPlot(
+  combined,
+  features = "nFeature_RNA",
+  group.by = "species",
+  pt.size = 0  # 点を非表示にして分布を見やすく
+)
+ggsave( p2 , file =output_path , height = 6,width = 6 )
+
+output_path <- file.path(dir_path, "quality_vln_clusters.pdf")
+p3 <- VlnPlot(
+  combined,
+  features = "nFeature_RNA",
+  group.by = "seurat_clusters",
+  pt.size = 0  # 点を非表示にして分布を見やすく
+)
+ggsave( p3 , file =output_path , height = 6,width = 6 )
+```
+
+
+# クラスタ7の解析
+```{r}
+# クラスタ7の細胞 vs その他の細胞で差分解析
+markers_cluster7 <- FindMarkers(
+  combined,
+  ident.1 = 7,
+  min.pct = 0.25,        # 発現割合の閾値
+  logfc.threshold = 0.25 # 発現差の閾値
+)
+
+# 発現差が大きく、統計的に有意な遺伝子を上位から抽出
+top_genes <- head(rownames(markers_cluster7[order(markers_cluster7$avg_log2FC, decreasing = TRUE), ]), 6)
+
+FeaturePlot(
+  combined,
+  features = top_genes,
+  cols = c("lightgrey", "blue"),
+  reduction = "umap"
+)
+```

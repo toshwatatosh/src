@@ -1,0 +1,517 @@
+---
+title: "Integrate ATAC data"
+subtitle: "Marmoset"
+doc_type: 作業報告書
+author: 株式会社ダイナコム 久世、佐藤、江端
+date: "`r format(Sys.time(), '%Y年%m月%d日')`"
+output:
+    html_document:
+        toc: true
+        toc_depth: 4
+        toc_float:    # 目次は固定にしない
+          collapsed: false
+        number_section: true
+        pandoc_args: ["--from", "markdown+autolink_bare_uris+tex_math_single_backslash-implicit_figures"]
+        self_contained: False
+---
+
+```{=html}
+<!-- 
+sample1
+sample1
+merge
+Integrate
+
+QC & preprocess
+PCA / UMAP / Cluster/ CellCycle / FeatureGene / DEG
+
+-->
+```
+```{r setup, include=FALSE}
+setwd("/Analysis/work/")
+
+# ライブラリ読み込み先を指定
+.libPaths()
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(dtw)
+library(Seurat)
+library(yaml)
+library(scales)
+library(patchwork)
+```
+
+## Function
+
+```{r function}
+
+### ggplot png & pdf
+###
+### @input : p, outfile  height = 10,width = 10
+### @return : None
+wggplot <- function(p , outfile , height = 10,width = 10 ){
+  output.file <- paste(outfile ,".pdf", sep = "")
+  ggsave( p , file =output.file , height = height,width = width )
+  output.file <- paste(outfile ,".png", sep = "")
+  ggsave( p , file =output.file , height = height,width = width )
+}
+
+
+## Sub Function: 遺伝子陽性細胞数を測定
+
+calculate_positive_percentage <- function(df, gene_name ,threshold = 0 ) {
+  df %>%
+    group_by(pseudotime_bin) %>%
+    summarise(
+      total_cells = n(),
+      positive_cells = sum(!!sym(gene_name) > threshold),
+      positive_percentage = (positive_cells / total_cells) * 100,
+      .groups = 'drop'
+    ) %>% arrange(pseudotime_bin)
+}
+
+
+
+# Sub Function: スライディングウィンドウ平均を計算する関数
+sliding_window_average <- function(df, window_size, target_column) {
+  # 最大のpseudotime_bin値
+  max_bin <- max(df$pseudotime_bin)
+  
+  # スライディングウィンドウの開始位置
+  start_bins <- 0:(max_bin - window_size + 1)
+  
+  # 各ウィンドウに対して平均を計算
+  result <- map_df(start_bins, function(start_bin) {
+    end_bin <- start_bin + window_size - 1
+    
+    window_data <- df %>%
+      filter(pseudotime_bin >= start_bin & pseudotime_bin <= end_bin)
+    
+    avg_value <- mean(window_data[[target_column]], na.rm = TRUE)
+    
+    tibble(
+      window_start = start_bin,
+      window_end = end_bin,
+      target_column = target_column,
+      average_value = avg_value
+    )
+  })
+  
+  return(result)
+}
+
+######
+## Main Function: 時系列データを細胞数から予測
+######
+PredTime <- function(timebin_data , param,palettedt,brdu_perid ){
+  #timebin_data <-  fitdata$marmoset$time.bin.data
+  
+  bincount <-  timebin_data$sds.data %>% 
+    group_by(time.idx ) %>% 
+    summarise( count = n()) %>%
+    ungroup()
+  
+  totalcell <-  bincount$count %>% sum()
+  Pred_cellPerDay <-  totalcell / brdu_perid
+  Pred_RealTime <-  bincount %>% 
+    mutate( PredDay = count / Pred_cellPerDay ) %>% 
+    mutate( cum_freq = cumsum(PredDay )) %>%
+    mutate(st = cum_freq- PredDay ,end = cum_freq)
+  
+  output.file = paste0( param$outdir,"/Predocted_binTime_from_number_of_cell.tsv" )
+  write.table(Pred_RealTime , file =output.file , quote = F ,sep ="\t" ,row.names = F)
+  
+  # 文字サイズの設定（後で変更可能）
+  base_size <- 24
+  axis_title_size <- base_size
+  axis_text_size <- base_size - 2
+  legend_text_size <- base_size - 2
+  
+  # プロット作成
+  p <- ggplot(Pred_RealTime, aes(x = time.idx)) +
+    geom_bar(aes(y = count), stat = "identity", fill = "grey", alpha = 0.7) +
+    geom_line(aes(y = cum_freq * max(count) / max(cum_freq)), color = "red", size = 1.2) +
+    scale_y_continuous(
+      name = "Count",
+      sec.axis = sec_axis(~ . * max(Pred_RealTime$cum_freq) / max(Pred_RealTime$count),
+                          name = "Predicted Day")
+    ) +
+    # 右軸の破線（7の倍数）
+    geom_hline(yintercept = seq(7, 42, by = 7) * max(Pred_RealTime$count) / max(Pred_RealTime$cum_freq),
+               linetype = "dashed", color = "grey") +
+    labs(x = "Pseudotime Bin") +
+    theme_minimal(base_size = base_size) +
+    theme(
+      axis.title.x = element_text(size = axis_title_size),
+      axis.title.y = element_text(size = axis_title_size),
+      axis.text = element_text(size = axis_text_size),
+      axis.title.y.right = element_text(size = axis_title_size, color = "red"),
+      legend.text = element_text(size = legend_text_size)
+    ) + 
+    theme_classic() 
+  
+  print(p)
+  output.file = paste0( param$outdir,"/Predict_RealTime" )
+  wggplot( p , outfile =output.file , height = 4,width = 6 )
+  
+  #########
+  
+  bincount_Cluster <- timebin_data$umap.sds %>% 
+    dplyr::select( "Cell" ,"time.idx","cluster" ) %>% 
+    group_by(time.idx,cluster ) %>% 
+    summarise( count = n()) %>%
+    ungroup() %>%
+    left_join(. , Pred_RealTime , by ="time.idx")
+  
+  # set cluster color
+  names(palettedt) <- c(0:(length(palettedt)-1) )
+  
+  # 文字サイズ設定
+  base_size <- 20
+  axis_title_size <- base_size
+  axis_text_size <- base_size - 2
+  
+  # グラフ作成
+  p <-ggplot(bincount_Cluster, aes(x = time.idx, y = count.x, fill = cluster)) +
+    geom_bar(stat = "identity", position = "stack") +
+    geom_line(data = bincount_Cluster %>% group_by(time.idx) %>% summarise(cum_freq = max(cum_freq)),
+              aes(x = time.idx, y = cum_freq * max(bincount_Cluster$count.x) / max(bincount_Cluster$cum_freq)), 
+              inherit.aes = FALSE, color = "black", size = 1.2) +
+    geom_hline(yintercept = c(7, 14, 21, 28, 35, 42) * max(bincount_Cluster$count.x) / max(bincount_Cluster$cum_freq),
+               linetype = "dashed", color = "gray") +
+    scale_y_continuous(
+      name = "Count",
+      sec.axis = sec_axis(~ . * max(bincount_Cluster$cum_freq) / max(bincount_Cluster$count.x),
+                          name = "Predicted Day")
+    ) +
+    scale_fill_manual( values = palettedt ) +
+    labs(x = "Pseudotime Bin") +
+    theme_minimal(base_size = base_size) +
+    theme(
+      axis.title.x = element_text(size = axis_title_size),
+      axis.title.y = element_text(size = axis_title_size),
+      axis.text = element_text(size = axis_text_size),
+      axis.title.y.right = element_text(size = axis_title_size, color = "black")
+    )+ 
+    theme_classic() 
+  
+  print(p)
+  output.file = paste0( param$outdir,"/Predict_RealTime_clusterBarplot" )
+  wggplot( p , outfile =output.file , height = 4,width = 6 )
+
+  return( Pred_RealTime )
+}
+
+
+#####
+## Main Function
+#####
+
+CalcPositivCell <-function(SeuratOBJ , timebin_data, param , brduGene , brdu_perid,Pred_RealTime, brdu.data){
+  
+
+  results_list_swindows <- list()
+  gene_expression_values <- GetAssayData(SeuratOBJ[brduGene, timebin_data$sds.data$Cell], layer="count")
+  
+  # スライディングウィンドウのサイズ
+  window_size <- 14
+  max_v <- brdu_perid
+  
+  for (gene in brduGene) {
+    scRNA_df <- gene_expression_values %>%
+      t %>%
+      as.data.frame %>%
+      dplyr::select( !!sym(gene) ) %>%
+      mutate(cell_id = rownames(.),
+             pseudotime_bin = timebin_data$sds.data %>% filter(Cell == Cell) %>% pull(time.idx))
+  
+    pseudotime_positive <- calculate_positive_percentage(scRNA_df, gene, mean(scRNA_df[[gene]]))
+    pseudotime_positive <- pseudotime_positive  %>% 
+      mutate(preadTime = Pred_RealTime %>% filter(time.idx == pseudotime_bin ) %>% pull(st) )
+    
+    # preadTimeのユニークな値（昇順）
+    pread_values <- sort(unique(pseudotime_positive$preadTime))
+    n <- length(pread_values)
+    # スライディングウィンドウの開始位置（すべてのpreadTimeに対して）
+    start_times <- pread_values
+    # 各ウィンドウに対して計算
+    # ウィンドウ内のpreadTimeを構成（ループして不足分を補う）
+    window_times <- lapply(c(0:max_v), function(x,w,maxv){ 
+        endt=ifelse( (x+w) < maxv ,x+w , (x+w) - maxv  );
+        return( c(x,endt))
+      },w=window_size,maxv=max_v) %>% do.call(rbind,.)
+    colnames(window_times) <- c("start_time","end_time")
+      
+    sliding_results <- apply(window_times, 1, function(x){
+        window_start_preadTime <- x[1]
+        window_end_preadTime <- x[1] + window_size
+      if( x[1] < x[2]){ # maxv > end
+        extractCell = pseudotime_positive %>%
+          filter( preadTime >= x[1] &  preadTime < x[2])
+      } else{
+        extractCell = pseudotime_positive %>%
+          filter( preadTime >= x[1] |  preadTime <x[2])
+      }
+      totalcell =  pseudotime_positive %>%  
+            pull(positive_cells) %>%
+            sum() 
+      positiveCells  =  extractCell %>%  
+            pull(positive_cells ) %>%
+            sum() 
+      positive_percentage =   100* positiveCells/totalcell
+      return( c(window_start_preadTime = window_start_preadTime,
+                window_end_preadTime = window_end_preadTime,
+                sum_total_cells=totalcell,
+                sum_positive_cells = positiveCells ,
+                positive_percentage = positive_percentage) 
+            )
+      }) %>% t %>% as.data.frame()
+  
+    # brdu spline
+    spline_result <- brdu.data %>%
+      filter(Gene == gene) %>%
+      mutate(day = week * 7) %>% 
+      with(spline(x = day, y = Pct, xout = sliding_results$window_start_preadTime , method = "fmm"))
+  
+    brdu_df <- data.frame(real_time = spline_result$x, brdu_positive_percentage = spline_result$y)
+  
+    correlation_value <- cor(sliding_results$positive_percentage,
+                             brdu_df$brdu_positive_percentage[1:nrow(sliding_results)],
+                             method = "spearman")
+  
+    pearson <- cor(sliding_results$positive_percentage, 
+                   brdu_df$brdu_positive_percentage[1:nrow(sliding_results)],
+                   method = "pearson")
+    ccf_result <- ccf(sliding_results$positive_percentage, 
+                   brdu_df$brdu_positive_percentage[1:nrow(sliding_results)],
+                   plot = FALSE)
+    max_ccf <- max(ccf_result$acf)
+    lag_at_max <- ccf_result$lag[which.max(ccf_result$acf)]
+    
+    results_list_swindows[[gene]] <- list(
+      x = sliding_results$positive_percentage,
+      y = brdu_df$brdu_positive_percentage[1:brdu_perid ],
+      pseudotime = pseudotime_positive,
+      pseudotime_window =sliding_results ,
+      brdu = brdu_df,
+      brdu.org = brdu.data, 
+      correlation = correlation_value,
+      pearson = pearson,
+      MaxCCF = max_ccf,
+      lag_at_max = lag_at_max
+    )
+  }
+  return(results_list_swindows)
+}
+
+
+
+# Main Function: 比較結果のplot
+
+PlotData <- function(results_list_swindows , brduGene ,param){
+  
+  Plot_List1 <- list()
+  Plot_List2 <- list()
+  for (gene in brduGene) {
+    print(gene)
+    colnames(  results_list_swindows[[gene]]$brdu ) <- c( "real_time" , "Brdu")
+    Plot_List1[[gene]]<- cbind( results_list_swindows[[gene]]$brdu , Exp = results_list_swindows[[gene]]$x) %>% 
+      as.data.frame() %>% 
+      pivot_longer( -real_time , names_to = "type" , values_to =  "val") %>%
+      ggplot(aes( x = real_time  , y =val , col = type )) + 
+        geom_line() + 
+        labs(title = gene)+
+        theme_classic() 
+    #plot( Plot_List1[[gene]])
+    output.file = paste0( param$outdir,"/Plot_PositivCell_PredictTime_",gene )
+    wggplot( Plot_List1[[gene]], outfile =output.file , height = 4,width = 6 )
+    
+    Plot_List2[[gene]]<- cbind( results_list_swindows[[gene]]$brdu.org %>% filter( Gene == gene & week < 6) , 
+               Exp = results_list_swindows[[gene]]$x[c(0,6,13,20,27,34,41)]) %>% 
+      as.data.frame() %>% dplyr::select(week,Pct ,Exp) %>% rename( "Brdu" = "Pct") %>%
+      pivot_longer( -week  , names_to = "type" , values_to =  "val") %>%　
+      mutate( type = factor( type , levels = c( "Brdu","Exp"))) %>% 
+      ggplot(aes( x = week   , y =val , col = type )) + 
+        geom_line() + 
+        labs(title = gene)+
+        theme_classic() 
+    #plot(Plot_List2[[gene]])
+    output.file = paste0( param$outdir,"/Plot_PositivCell_PredictTime_Week_",gene ,".pdf" )
+    wggplot( Plot_List2[[gene]] , outfile = output.file, height = 4,width = 6 )
+  }  
+  # patchworkで結合 & 凡例を共通化
+  final_plot <- wrap_plots(Plot_List1, ncol = length(brduGene) ) +
+    plot_layout(guides = "collect") & theme(legend.position = "right")
+  print(final_plot)
+  output.file = paste0( param$outdir,"/Plot_PositivCell_PredictTime_BrduGene.pdf" )
+  width = (4 * length(brduGene)) +1
+  wggplot( final_plot , outfile = output.file, height = 4,width =  width)
+  
+  # patchworkで結合 & 凡例を共通化
+  final_plot <- wrap_plots(Plot_List2, ncol = length(brduGene) ) +
+    plot_layout(guides = "collect") & theme(legend.position = "right")
+  print(final_plot)
+  output.file = paste0( param$outdir,"/Plot_PositivCell_PredictTime_Week_BrduGene.pdf" )
+  width = (4 * length(brduGene)) +1
+  wggplot( final_plot , outfile = output.file, height = 4,width =  width)
+  
+  summary_df <- data.frame(
+    Gene = names(results_list_swindows),
+    SpearmanCorrelation = sapply(results_list_swindows, function(x) round(x$correlation, 2)),
+    pearson = sapply(results_list_swindows, function(x) round(x$pearson, 2)),
+    MaxCCF = sapply(results_list_swindows, function(x) round(x$MaxCCF, 2)),
+    lag_at_max = sapply(results_list_swindows, function(x) round(x$lag_at_max, 2))
+  )
+  summary_df
+  output.file = paste0( param$outdir,"/correlation_2weekSliding_expPct_comparBrdU.txt" )
+  write.table(summary_df , file =output.file , quote = F ,sep ="\t" ,row.names = F)
+
+}
+
+```
+
+## 1. データの読み込み
+
+```{r load-data}
+
+#brdu_perid = 6.7*7
+brdu_perid = 6.63*7
+param <- NULL
+palettedt <- readRDS("/Analysis/work//work/out_20250709_hdWGCNA/def.pallet.rds")
+names(palettedt) <- NULL
+pattern_list <- c( "/", "_P2/", "_P3/", "_P4/", "_P5/")
+
+
+
+mainprocess <- function( param , SeuratOBJ , timebin_data ,palettedt,brdu_perid ,brduGene ,brdu.data,individual =NULL ){
+  if (!dir.exists(param$outdir)) {
+    dir.create(param$outdir, recursive = TRUE)
+    message("ディレクトリを作成しました: ", param$outdir)
+  } else {
+    message("output ディレクトリは既に存在します: ", param$outdir)
+  }
+  
+  if( !is.null(individual) ){
+    SeuratOBJ <- subset(SeuratOBJ , orig.ident == individual)
+    timebin_data$sds.data <- timebin_data$sds.data %>% filter(  grepl( paste0("^",individual), Cell) )
+    timebin_data$umap.sds <- timebin_data$umap.sds %>% filter(  grepl(paste0("^",individual), Cell) )
+  }
+  
+  Pred_RealTime <- PredTime(timebin_data , param,palettedt,brdu_perid  )
+  results_list_swindows <-CalcPositivCell(SeuratOBJ , timebin_data, param , brduGene , brdu_perid,Pred_RealTime, brdu.data)
+  PlotData(results_list_swindows , brduGene ,param)
+  return(results_list_swindows)
+}
+
+
+swindows_resuts <- list()
+
+for( ptn in pattern_list){
+  main_dir <- paste0( "/Analysis/work/work_kuze/result/re260616_CombinedTrajectory", ptn )
+  fitdir <-  paste0( "/Analysis/work/work_kuze/result/260119_CombinedTrajectory", ptn )
+  fitdata <- readRDS( paste0( fitdir,"/PseudotimeGAM_fittigGeneExp.rds") )
+  SeuratOBJ <- fitdata$marmoset$seuratobj
+  timebin_data <-  fitdata$marmoset$time.bin.data
+  pattern_rsult1 <-list()
+  pattern_rsult2 <-list()
+  
+  param$outdir <- paste0( main_dir,"/Human_Pred/")
+  if (!dir.exists(param$outdir)) {
+    dir.create(param$outdir, recursive = TRUE)
+    message("ディレクトリを作成しました: ", param$outdir)
+  } else {
+    message("output ディレクトリは既に存在します: ", param$outdir)
+  }
+  Pred_RealTime_human <- PredTime(fitdata$human$time.bin.data , param , palettedt , brdu_perid  )
+  
+  # 1頭目
+  brdu.data <- read.table("/Analysis/work/work/Brdu_Compare/Brdu_data_mod.txt", sep ="	", header = TRUE) %>%
+              filter(Pct != "NA")
+  brduGene <- c("PIWIL4", "DPPA4", "DND1")
+  param$outdir <- paste0( main_dir,"/brdu_I7566M/")
+  pattern_rsult1[["Merge"]] = mainprocess( param , SeuratOBJ , timebin_data ,palettedt,brdu_perid ,brduGene ,brdu.data  )
+  individual　<- "I7704M_1yr8mnth"
+  param$outdir <- paste0( main_dir,"/brdu_I7566M_",individual ,"/")
+  pattern_rsult1[[individual]] =mainprocess( param , SeuratOBJ , timebin_data ,
+                                          palettedt,brdu_perid ,brduGene ,brdu.data ,individual )
+  individual　<- "I7436M_2ys8mnth"
+  param$outdir <- paste0( main_dir,"/brdu_I7566M_",individual ,"/")
+  pattern_rsult1[[individual]] =mainprocess( param , SeuratOBJ , timebin_data ,
+                                          palettedt,brdu_perid ,brduGene ,brdu.data ,individual )
+  
+  #2頭目
+  brdu.data <- read.table("/Analysis/work/work/Brdu_Compare/Brdu_data_mod_I7827M.txt", sep ="	", header = TRUE) %>%
+              filter(Pct != "NA")
+  brduGene <- c("PIWIL4",  "DND1")
+  param$outdir <- paste0( main_dir,"/brdu_I7827M/")
+  pattern_rsult2[["Merge"]] =mainprocess( param , SeuratOBJ , timebin_data ,palettedt,brdu_perid ,brduGene ,brdu.data  )
+  individual　<- "I7704M_1yr8mnth"
+  param$outdir <- paste0( main_dir,"/brdu_I7566M_",individual ,"/")
+  pattern_rsult2[[individual]] =mainprocess( param , SeuratOBJ , timebin_data ,
+                                          palettedt,brdu_perid ,brduGene ,brdu.data ,individual )
+  individual　<- "I7436M_2ys8mnth"
+  param$outdir <- paste0( main_dir,"/brdu_I7566M_",individual ,"/")
+  pattern_rsult2[[individual]] =mainprocess( param , SeuratOBJ , timebin_data ,
+                                          palettedt,brdu_perid ,brduGene ,brdu.data ,individual )
+  swindows_resuts[[ptn]] =  list( I7566M = pattern_rsult1 , I7827M = pattern_rsult2)
+}
+
+
+brduGene <- c("PIWIL4", "DPPA4", "DND1")
+corrilation_matrix <- data.frame(
+            gene = NULL,
+            pattern  =NULL,
+            scSample = NULL,
+            BrduSample= NULL,
+            Spearman = NULL,
+            pearson = NULL,
+            MaxCCF = NULL,
+            lag = NULL
+            )
+
+for( ptn in pattern_list){
+  modptn = gsub("/","",ptn)
+  if(modptn == ""){
+    modptn ="P1"
+  }
+  modptn = gsub("_","",modptn)
+  
+  for( brdusample in c("I7566M","I7827M") ){
+    for( scSample in c("Merge","I7704M_1yr8mnth","I7436M_2ys8mnth")){
+      res_win <- swindows_resuts[[ptn]][[brdusample]][[scSample]]
+      for (gene in brduGene){
+        if ( gene %in% names( res_win)){
+          summary_df <- data.frame(
+            gene = gene,
+            pattern  =modptn,
+            scSample = scSample,
+            BrduSample= brdusample,
+            Spearman = round(res_win[[gene]]$correlation,5),
+            pearson = round(res_win[[gene]]$pearson, 5),
+            MaxCCF = round(res_win[[gene]]$MaxCCF, 5),
+            lag =  round(res_win[[gene]]$lag_at_max, 5)
+          )
+          corrilation_matrix <-rbind(corrilation_matrix ,summary_df)
+        }
+      }
+      # average
+      summary_df <- data.frame(
+            gene = "Average",
+            pattern  =modptn,
+            scSample = scSample,
+            BrduSample= brdusample,
+            Spearman= sapply(res_win, function(x) x$correlation) %>% mean() %>% round(.,2),
+            pearson = sapply(res_win, function(x) x$pearson) %>% mean() %>% round(.,2),
+            MaxCCF = sapply(res_win, function(x) x$MaxCCF) %>% mean() %>% round(.,2),
+            lag= sapply(res_win, function(x) x$lag_at_max) %>% mean() %>% round(.,2)
+          )
+        corrilation_matrix <-rbind(corrilation_matrix ,summary_df)
+    }
+  }
+}
+output.file = paste0( main_dir,"/Brdu_ALL_conbined_Cor_data.txt" )
+write.table(corrilation_matrix , file =output.file , quote = F ,sep ="\t" ,row.names = F)
+
+```
